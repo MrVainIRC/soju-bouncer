@@ -721,11 +721,26 @@ func (uc *upstreamConn) storeNetworkMetadataValue(ctx context.Context, target, k
 
 func (uc *upstreamConn) forwardNetworkMetadataChange(ctx context.Context, target, key string, value *string) {
 	msg := metadataNotification(uc.metadataVersion(), uc.nick, target, key, value)
+	boundClients := make(map[string]bool)
 	uc.forEachDownstream(func(dc *downstreamConn) {
+		if dc.clientName != "" {
+			boundClients[dc.clientName] = true
+		}
 		if dc.hasMetadataCap() {
 			dc.SendMessage(ctx, convertMetadataMessage(msg, uc.metadataVersion(), dc.metadataVersion(), dc.nick, true))
 		}
 	})
+	if !uc.srv.Config().MetadataRootCompat || !uc.srv.Config().MetadataClientSync {
+		return
+	}
+	// Root Metadata compatibility: Mango keeps its global profile subscription
+	// on the root connection even when BOUNCER BIND uses a separate network
+	// connection. Mirror only to roots whose client ID is bound to this network.
+	for _, dc := range uc.user.downstreamConns {
+		if dc.network == nil && boundClients[dc.clientName] && dc.hasMetadataCap() {
+			dc.SendMessage(ctx, convertMetadataMessage(msg, uc.metadataVersion(), dc.metadataVersion(), dc.nick, true))
+		}
+	}
 }
 
 func isMetadataBatchType(typ string) bool {

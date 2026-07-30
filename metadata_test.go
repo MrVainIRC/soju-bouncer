@@ -515,7 +515,6 @@ func TestMetadataClientSyncEnabled(t *testing.T) {
 func TestMangoRootMetadataCompatStoresLastActiveProfile(t *testing.T) {
 	dcNetwork, _ := newMetadataTestNetworkDownstreams(t)
 	dcNetwork.clientName = "profileAlpha"
-	dcNetwork.user.networks = []*network{dcNetwork.network}
 
 	cfg := *dcNetwork.srv.Config()
 	cfg.MetadataRootCompat = true
@@ -534,6 +533,24 @@ func TestMangoRootMetadataCompatStoresLastActiveProfile(t *testing.T) {
 	uc.caps.SetEnabled("draft/metadata-2", true)
 	dcNetwork.network.conn = uc
 
+	secondRecord := database.NewNetwork("irc+insecure://second.invalid")
+	if err := dcNetwork.srv.db.StoreNetwork(context.Background(), dcNetwork.user.ID, secondRecord); err != nil {
+		t.Fatalf("StoreNetwork(second) failed: %v", err)
+	}
+	secondNetwork := newNetwork(dcNetwork.user, secondRecord, nil)
+	secondUpstreamIRC := &metadataTestIRCConn{}
+	secondUC := &upstreamConn{
+		conn:        newConn(dcNetwork.srv, secondUpstreamIRC, &connOptions{Logger: newDebugLogger(t)}),
+		user:        dcNetwork.user,
+		network:     secondNetwork,
+		caps:        xirc.NewCapRegistry(),
+		pendingCmds: make(map[string][]pendingUpstreamCommand),
+	}
+	secondUC.caps.Available["draft/metadata-3"] = ""
+	secondUC.caps.SetEnabled("draft/metadata-3", true)
+	secondNetwork.conn = secondUC
+	dcNetwork.user.networks = []*network{dcNetwork.network, secondNetwork}
+
 	dcRoot := newDownstreamConn(dcNetwork.srv, &metadataTestIRCConn{}, 3)
 	dcRoot.user = dcNetwork.user
 	dcRoot.clientName = dcNetwork.clientName
@@ -551,12 +568,15 @@ func TestMangoRootMetadataCompatStoresLastActiveProfile(t *testing.T) {
 		t.Fatalf("root SET = handled %v, err %v", handled, err)
 	}
 	assertMetadataTestCommands(t, upstreamIRC, 0, set.Params)
-	profile, err := dcRoot.srv.db.ListClientNetworkMetadata(ctx, dcNetwork.network.ID, dcRoot.clientName)
-	if err != nil || len(profile) != 1 || profile[0].Key != "status" || profile[0].Value != "alpha" {
-		t.Fatalf("root SET profile = %#v, %v", profile, err)
-	}
-	if dcNetwork.network.metadataLastActiveClient != dcRoot.clientName {
-		t.Fatalf("last active client = %q, want %q", dcNetwork.network.metadataLastActiveClient, dcRoot.clientName)
+	assertMetadataTestCommands(t, secondUpstreamIRC, 0, set.Params)
+	for _, network := range []*network{dcNetwork.network, secondNetwork} {
+		profile, err := dcRoot.srv.db.ListClientNetworkMetadata(ctx, network.ID, dcRoot.clientName)
+		if err != nil || len(profile) != 1 || profile[0].Key != "status" || profile[0].Value != "alpha" {
+			t.Fatalf("root SET profile for %q = %#v, %v", network.GetName(), profile, err)
+		}
+		if network.metadataLastActiveClient != dcRoot.clientName {
+			t.Fatalf("%q last active client = %q, want %q", network.GetName(), network.metadataLastActiveClient, dcRoot.clientName)
+		}
 	}
 
 	clear := &irc.Message{Command: "METADATA", Params: []string{"*", "CLEAR"}}
@@ -565,9 +585,12 @@ func TestMangoRootMetadataCompatStoresLastActiveProfile(t *testing.T) {
 		t.Fatalf("root CLEAR = handled %v, err %v", handled, err)
 	}
 	assertMetadataTestCommands(t, upstreamIRC, 1, clear.Params)
-	profile, err = dcRoot.srv.db.ListClientNetworkMetadata(ctx, dcNetwork.network.ID, dcRoot.clientName)
-	if err != nil || len(profile) != 0 {
-		t.Fatalf("root CLEAR profile = %#v, %v", profile, err)
+	assertMetadataTestCommands(t, secondUpstreamIRC, 1, clear.Params)
+	for _, network := range []*network{dcNetwork.network, secondNetwork} {
+		profile, err := dcRoot.srv.db.ListClientNetworkMetadata(ctx, network.ID, dcRoot.clientName)
+		if err != nil || len(profile) != 0 {
+			t.Fatalf("root CLEAR profile for %q = %#v, %v", network.GetName(), profile, err)
+		}
 	}
 }
 
@@ -914,6 +937,123 @@ func TestLastActiveMetadataSwitchesOnDownstreamMessages(t *testing.T) {
 	runMetadataPublishFallbackEvent(t, dcDesktop.user)
 	assertMetadataDownstreamMessageCount(t, desktopConn, 2)
 	assertMetadataDownstreamMessageCount(t, mobileConn, 2)
+}
+
+func TestLastActiveMetadataWithRootCompatAndBouncerBind(t *testing.T) {
+	dcA, dcB := newMetadataTestNetworkDownstreams(t)
+	dcA.clientName = "alpha"
+	dcB.clientName = "beta"
+	dcA.registered = true
+	dcB.registered = true
+
+	cfg := *dcA.srv.Config()
+	cfg.MetadataUpstreamPolicy = config.MetadataUpstreamPolicyLastActive
+	cfg.MetadataClientSync = true
+	cfg.MetadataRootCompat = true
+	cfg.BouncerNetworkBind = true
+	dcA.srv.SetConfig(&cfg)
+
+	newRoot := func(id uint64, clientName string) *downstreamConn {
+		dc := newDownstreamConn(dcA.srv, &metadataTestIRCConn{}, id)
+		dc.user = dcA.user
+		dc.clientName = clientName
+		dc.nick = testUsername
+		setMetadataTestVersion(dc, metadataVersion2)
+		dcA.user.downstreamConns = append(dcA.user.downstreamConns, dc)
+		t.Cleanup(func() {
+			_ = dc.Close()
+		})
+		return dc
+	}
+	rootA := newRoot(3, dcA.clientName)
+	rootB := newRoot(4, dcB.clientName)
+	unboundRoot := newRoot(5, "unbound")
+
+	upstreamIRC := &metadataTestIRCConn{}
+	uc := &upstreamConn{
+		conn:         newConn(dcA.srv, upstreamIRC, &connOptions{Logger: newDebugLogger(t)}),
+		user:         dcA.user,
+		network:      dcA.network,
+		channels:     xirc.NewCaseMappingMap[*upstreamChannel](stdCaseMapping),
+		users:        xirc.NewCaseMappingMap[*upstreamUser](stdCaseMapping),
+		caps:         xirc.NewCapRegistry(),
+		batches:      make(map[string]upstreamBatch),
+		pendingCmds:  make(map[string][]pendingUpstreamCommand),
+		serverPrefix: testServerPrefix,
+		nick:         "nick",
+		isupport:     make(map[string]*string),
+	}
+	uc.caps.Available["draft/metadata-2"] = ""
+	uc.caps.SetEnabled("draft/metadata-2", true)
+	dcA.network.conn = uc
+
+	ctx := context.Background()
+	alphaAvatar := "https://example.test/alpha"
+	betaAvatar := "https://example.test/beta"
+	betaStatus := "mobile"
+	for _, md := range []struct {
+		client, key, value string
+	}{
+		{dcA.clientName, "avatar", alphaAvatar},
+		{dcB.clientName, "avatar", betaAvatar},
+		{dcB.clientName, "status", betaStatus},
+	} {
+		if err := dcA.srv.db.StoreClientNetworkMetadata(ctx, dcA.network.ID, md.client, md.key, &md.value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := dcA.srv.db.StoreNetworkMetadata(ctx, dcA.network.ID, "avatar", &betaAvatar); err != nil {
+		t.Fatal(err)
+	}
+	if err := dcA.srv.db.StoreNetworkMetadata(ctx, dcA.network.ID, "status", &betaStatus); err != nil {
+		t.Fatal(err)
+	}
+	dcA.network.metadataLastActiveClient = dcB.clientName
+	dcA.network.metadataLastActiveUpstream = uc
+
+	if err := dcA.handleMessage(ctx, &irc.Message{Command: "PRIVMSG", Params: []string{"#test", "alpha active"}}); err != nil {
+		t.Fatalf("alpha activity failed: %v", err)
+	}
+	assertMetadataUpstreamMessages(t, upstreamIRC,
+		[]string{"*", "SET", "avatar", alphaAvatar},
+		[]string{"*", "SET", "status"})
+	if len(uc.metadataPublishPending) != 2 {
+		t.Fatalf("initial pending Metadata publishes = %#v, want avatar and status", uc.metadataPublishPending)
+	}
+
+	for i, reply := range []*irc.Message{
+		{Tags: irc.Tags{}, Prefix: testServerPrefix, Command: xirc.RPL_KEYVALUE, Params: []string{"nick", "nick", "avatar", "*", alphaAvatar}},
+		{Tags: irc.Tags{}, Prefix: testServerPrefix, Command: xirc.RPL_KEYNOTSET, Params: []string{"nick", "nick", "status", "Key not set"}},
+	} {
+		if err := uc.handleMessage(ctx, reply); err != nil {
+			t.Fatalf("alpha Metadata confirmation failed: %v", err)
+		}
+		if got, want := len(uc.metadataPublishPending), 1-i; got != want {
+			t.Fatalf("pending Metadata publishes after reply %d = %#v, want %d", i, uc.metadataPublishPending, want)
+		}
+	}
+	runMetadataPublishFallbackEvent(t, dcA.user)
+	runMetadataPublishFallbackEvent(t, dcA.user)
+
+	for name, dc := range map[string]*downstreamConn{
+		"network A": dcA,
+		"network B": dcB,
+		"root A":    rootA,
+		"root B":    rootB,
+	} {
+		assertMetadataDownstreamMessageCount(t, dc.conn.conn.(*metadataTestIRCConn), 2)
+		t.Logf("%s received the confirmed avatar and status removal", name)
+	}
+	assertMetadataDownstreamMessageCount(t, unboundRoot.conn.conn.(*metadataTestIRCConn), 0)
+
+	if err := dcB.handleMessage(ctx, &irc.Message{Command: "PRIVMSG", Params: []string{"#test", "beta active"}}); err != nil {
+		t.Fatalf("beta activity failed: %v", err)
+	}
+	assertMetadataUpstreamMessages(t, upstreamIRC,
+		[]string{"*", "SET", "avatar", alphaAvatar},
+		[]string{"*", "SET", "status"},
+		[]string{"*", "SET", "avatar", betaAvatar},
+		[]string{"*", "SET", "status", betaStatus})
 }
 
 func TestLastActiveMetadataLatestActivityWinsPendingPublish(t *testing.T) {
