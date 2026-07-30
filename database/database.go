@@ -22,14 +22,18 @@ type MessageTargetLast struct {
 }
 
 type MessageOptions struct {
-	AfterID    int64
-	AfterTime  time.Time
-	BeforeTime time.Time
-	Limit      int
-	Events     bool
-	Sender     string
-	Text       string
-	TakeLast   bool
+	AfterID          int64
+	BeforeID         int64
+	AfterPositionID  int64
+	BeforePositionID int64
+	AfterTime        time.Time
+	BeforeTime       time.Time
+	Limit            int
+	Events           bool
+	Reactions        bool
+	Sender           string
+	Text             string
+	TakeLast         bool
 }
 
 type Database interface {
@@ -61,6 +65,13 @@ type Database interface {
 	GetReadReceipt(ctx context.Context, networkID int64, name string) (*ReadReceipt, error)
 	StoreReadReceipt(ctx context.Context, networkID int64, receipt *ReadReceipt) error
 
+	ListNetworkMetadata(ctx context.Context, networkID int64) ([]NetworkMetadata, error)
+	StoreNetworkMetadata(ctx context.Context, networkID int64, key string, value *string) error
+	ClearNetworkMetadata(ctx context.Context, networkID int64) error
+	ListClientNetworkMetadata(ctx context.Context, networkID int64, client string) ([]NetworkMetadata, error)
+	StoreClientNetworkMetadata(ctx context.Context, networkID int64, client, key string, value *string) error
+	ClearClientNetworkMetadata(ctx context.Context, networkID int64, client string) error
+
 	ListWebPushConfigs(ctx context.Context) ([]WebPushConfig, error)
 	StoreWebPushConfig(ctx context.Context, config *WebPushConfig) error
 
@@ -69,6 +80,7 @@ type Database interface {
 	DeleteWebPushSubscription(ctx context.Context, id int64) error
 
 	GetMessageLastID(ctx context.Context, networkID int64, name string) (int64, error)
+	GetMessageIDByMsgID(ctx context.Context, networkID int64, name, msgID string) (int64, *irc.Message, error)
 	GetMessageTarget(ctx context.Context, networkID int64, target string) (*MessageTarget, error)
 	ListMessageTargets(ctx context.Context, networkID int64) ([]MessageTarget, error)
 	StoreMessageTarget(ctx context.Context, networkID int64, mt *MessageTarget) error
@@ -187,6 +199,11 @@ type Network struct {
 	SASL            SASL
 	AutoAway        bool
 	Enabled         bool
+}
+
+type NetworkMetadata struct {
+	Key   string
+	Value string
 }
 
 func NewNetwork(addr string) *Network {

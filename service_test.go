@@ -1,6 +1,7 @@
 package soju
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -50,5 +51,73 @@ func TestSplit(t *testing.T) {
 	}
 	if _, err := splitWords("end of backquote \\"); err == nil {
 		t.Errorf("expected error on unterminated backquote sequence")
+	}
+}
+
+func TestServiceHelpHidesAdminCommands(t *testing.T) {
+	var lines []string
+	ctx := &serviceContext{
+		user: &user{},
+		print: func(text string) {
+			lines = append(lines, text)
+		},
+	}
+
+	if err := handleServiceHelp(ctx, nil); err != nil {
+		t.Fatalf("handleServiceHelp() failed: %v", err)
+	}
+
+	help := strings.Join(lines, "\n")
+	for _, hidden := range []string{
+		"server status",
+		"server notice",
+		"server debug",
+		"user create",
+		"user run",
+		"user status",
+	} {
+		if strings.Contains(help, hidden) {
+			t.Fatalf("non-admin help contains admin command %q:\n%v", hidden, help)
+		}
+	}
+	if !strings.Contains(help, "network status") {
+		t.Fatalf("non-admin help is missing regular command:\n%v", help)
+	}
+}
+
+func TestServiceHelpAdminCommands(t *testing.T) {
+	var lines []string
+	ctx := &serviceContext{
+		user:  &user{},
+		admin: true,
+		print: func(text string) {
+			lines = append(lines, text)
+		},
+	}
+
+	if err := handleServiceHelp(ctx, []string{"server"}); err != nil {
+		t.Fatalf("handleServiceHelp(server) failed: %v", err)
+	}
+
+	help := strings.Join(lines, "\n")
+	for _, want := range []string{
+		"server status",
+		"server notice",
+		"server debug",
+	} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("admin help is missing command %q:\n%v", want, help)
+		}
+	}
+}
+
+func TestServiceHelpRejectsAdminCommandForNonAdmin(t *testing.T) {
+	ctx := &serviceContext{
+		user:  &user{},
+		print: func(string) {},
+	}
+
+	if err := handleServiceHelp(ctx, []string{"server"}); err == nil {
+		t.Fatalf("non-admin help for admin command succeeded")
 	}
 }

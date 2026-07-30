@@ -57,6 +57,17 @@ func parseDuration(s string) (time.Duration, error) {
 	return time.Duration(v * 24 * float64(time.Hour)), nil
 }
 
+func parseBool(s string) (bool, error) {
+	switch strings.ToLower(s) {
+	case "yes":
+		return true, nil
+	case "no":
+		return false, nil
+	default:
+		return strconv.ParseBool(s)
+	}
+}
+
 type TLS struct {
 	CertPath, KeyPath string
 }
@@ -81,6 +92,14 @@ type FileUpload struct {
 	Source string
 }
 
+type MetadataUpstreamPolicy string
+
+const (
+	MetadataUpstreamPolicyAny        MetadataUpstreamPolicy = "any"
+	MetadataUpstreamPolicyNone       MetadataUpstreamPolicy = "none"
+	MetadataUpstreamPolicyLastActive MetadataUpstreamPolicy = "last-active"
+)
+
 type BasicServer struct {
 	Hostname                  string
 	Title                     string
@@ -95,6 +114,10 @@ type BasicServer struct {
 	MessageExpiry             time.Duration
 	EnableUsersOnAuth         bool
 	ClientCertAuth            bool
+	MetadataUpstreamPolicy    MetadataUpstreamPolicy
+	MetadataClientSync        bool
+	MetadataRootCompat        bool
+	BouncerNetworkBind        bool
 }
 
 type Server struct {
@@ -121,8 +144,10 @@ func Defaults() *Server {
 			MsgStore: MsgStore{
 				Driver: msgstore.DriverDB,
 			},
-			HTTPIngress:     "https://" + hostname,
-			MaxUserNetworks: -1,
+			HTTPIngress:            "https://" + hostname,
+			MaxUserNetworks:        -1,
+			MetadataUpstreamPolicy: MetadataUpstreamPolicyAny,
+			MetadataClientSync:     true,
 		},
 		DB: DB{
 			Driver: database.DriverSQLite3,
@@ -150,17 +175,21 @@ func Load(filename string) (*Server, error) {
 		Auth         []struct {
 			Params []string `scfg:",param"`
 		} `scfg:"auth"`
-		FileUpload          []string `scfg:"file-upload"`
-		HTTPOrigin          []string `scfg:"http-origin"`
-		HTTPIngress         string   `scfg:"http-ingress"`
-		AcceptProxyIP       []string `scfg:"accept-proxy-ip"`
-		AcceptProxyUnix     string   `scfg:"accept-proxy-unix"`
-		MaxUserNetworks     int      `scfg:"max-user-networks"`
-		UpstreamUserIP      []string `scfg:"upstream-user-ip"`
-		DisableInactiveUser string   `scfg:"disable-inactive-user"`
-		MessageExpiry       string   `scfg:"message-expiry"`
-		EnableUserOnAuth    string   `scfg:"enable-user-on-auth"`
-		ClientCertAuth      string   `scfg:"client-cert-auth"`
+		FileUpload             []string `scfg:"file-upload"`
+		HTTPOrigin             []string `scfg:"http-origin"`
+		HTTPIngress            string   `scfg:"http-ingress"`
+		AcceptProxyIP          []string `scfg:"accept-proxy-ip"`
+		AcceptProxyUnix        string   `scfg:"accept-proxy-unix"`
+		MaxUserNetworks        int      `scfg:"max-user-networks"`
+		UpstreamUserIP         []string `scfg:"upstream-user-ip"`
+		DisableInactiveUser    string   `scfg:"disable-inactive-user"`
+		MessageExpiry          string   `scfg:"message-expiry"`
+		EnableUserOnAuth       string   `scfg:"enable-user-on-auth"`
+		ClientCertAuth         string   `scfg:"client-cert-auth"`
+		MetadataUpstreamPolicy string   `scfg:"metadata-upstream-policy"`
+		MetadataClientSync     string   `scfg:"metadata-client-sync"`
+		MetadataRootCompat     string   `scfg:"metadata-root-compat"`
+		BouncerNetworkBind     string   `scfg:"bouncer-network-bind"`
 	}
 
 	raw.MaxUserNetworks = -1
@@ -339,6 +368,36 @@ func Load(filename string) (*Server, error) {
 			return nil, fmt.Errorf("directive client-cert-auth: %v", err)
 		}
 		srv.ClientCertAuth = b
+	}
+	if raw.MetadataUpstreamPolicy != "" {
+		policy := MetadataUpstreamPolicy(raw.MetadataUpstreamPolicy)
+		switch policy {
+		case MetadataUpstreamPolicyAny, MetadataUpstreamPolicyNone, MetadataUpstreamPolicyLastActive:
+			srv.MetadataUpstreamPolicy = policy
+		default:
+			return nil, fmt.Errorf("directive metadata-upstream-policy: unknown policy %q", raw.MetadataUpstreamPolicy)
+		}
+	}
+	if raw.MetadataClientSync != "" {
+		b, err := parseBool(raw.MetadataClientSync)
+		if err != nil {
+			return nil, fmt.Errorf("directive metadata-client-sync: %v", err)
+		}
+		srv.MetadataClientSync = b
+	}
+	if raw.MetadataRootCompat != "" {
+		b, err := parseBool(raw.MetadataRootCompat)
+		if err != nil {
+			return nil, fmt.Errorf("directive metadata-root-compat: %v", err)
+		}
+		srv.MetadataRootCompat = b
+	}
+	if raw.BouncerNetworkBind != "" {
+		b, err := parseBool(raw.BouncerNetworkBind)
+		if err != nil {
+			return nil, fmt.Errorf("directive bouncer-network-bind: %v", err)
+		}
+		srv.BouncerNetworkBind = b
 	}
 
 	return srv, nil

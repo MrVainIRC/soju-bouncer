@@ -257,6 +257,9 @@ func (ms *fsMessageStore) parseMessagesBefore(ref time.Time, end time.Time, opti
 		} else if !t.Before(ref) {
 			break
 		}
+		if !messageAllowedInHistory(msg, options.Events, options.Reactions) {
+			continue
+		}
 		if selector != nil && !selector(msg) {
 			continue
 		}
@@ -305,6 +308,9 @@ func (ms *fsMessageStore) parseMessagesAfter(ref time.Time, end time.Time, optio
 			continue
 		} else if !t.Before(end) {
 			break
+		}
+		if !messageAllowedInHistory(msg, options.Events, options.Reactions) {
+			continue
 		}
 		if selector != nil && !selector(msg) {
 			continue
@@ -446,6 +452,264 @@ func (ms *fsMessageStore) LoadLatestID(ctx context.Context, id string, options *
 	return history[remaining:], nil
 }
 
+type fsHistoryRecord struct {
+	date      time.Time
+	timestamp time.Time
+	offset    int64
+	msg       *irc.Message
+}
+
+func compareFSPosition(dateA time.Time, offsetA int64, dateB time.Time, offsetB int64) int {
+	if dateA.Before(dateB) {
+		return -1
+	}
+	if dateA.After(dateB) {
+		return 1
+	}
+	switch {
+	case offsetA < offsetB:
+		return -1
+	case offsetA > offsetB:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func (ms *fsMessageStore) walkHistory(ctx context.Context, network *database.Network, entity string, f func(fsHistoryRecord) (bool, error)) error {
+	dir := filepath.Dir(ms.logPath(network, entity, time.Now()))
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		var year, month, day int
+		if n, _ := fmt.Sscanf(entry.Name(), "%04d-%02d-%02d.log", &year, &month, &day); n != 3 {
+			continue
+		}
+		ref := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.Local)
+		file, err := os.Open(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			return err
+		}
+
+		var offset int64
+		sc := bufio.NewScanner(file)
+		for sc.Scan() {
+			line := sc.Text()
+			msg, timestamp, err := ms.parseMessage(line, network, entity, ref, true)
+			if err != nil {
+				file.Close()
+				return err
+			}
+			if msg != nil {
+				stop, err := f(fsHistoryRecord{date: ref, timestamp: timestamp, offset: offset, msg: msg})
+				if err != nil {
+					file.Close()
+					return err
+				}
+				if stop {
+					file.Close()
+					return nil
+				}
+			}
+			offset += int64(len(line) + 1)
+			if err := ctx.Err(); err != nil {
+				file.Close()
+				return err
+			}
+		}
+		err = sc.Err()
+		file.Close()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (ms *fsMessageStore) ResolveMsgID(ctx context.Context, network *database.Network, entity, msgID string) (string, *irc.Message, error) {
+	var resolved string
+	var resolvedMsg *irc.Message
+	err := ms.walkHistory(ctx, network, entity, func(record fsHistoryRecord) (bool, error) {
+		if record.msg.Tags["msgid"] != msgID {
+			return false, nil
+		}
+		resolved = formatFSMsgID(network.ID, entity, record.date, record.offset)
+		resolvedMsg = record.msg
+		return true, nil
+	})
+	if err != nil {
+		return "", nil, err
+	}
+	if resolved == "" {
+		return "", nil, fmt.Errorf("cannot find message ID")
+	}
+	return resolved, resolvedMsg, nil
+}
+
+func (ms *fsMessageStore) loadIDRange(ctx context.Context, firstDate time.Time, firstOffset int64, secondDate time.Time, secondOffset int64, reverse bool, options *LoadMessageOptions) ([]*irc.Message, error) {
+	var history []*irc.Message
+	err := ms.walkHistory(ctx, options.Network, options.Entity, func(record fsHistoryRecord) (bool, error) {
+		afterFirst := firstDate.IsZero() || compareFSPosition(record.date, record.offset, firstDate, firstOffset) > 0
+		beforeSecond := secondDate.IsZero() || compareFSPosition(record.date, record.offset, secondDate, secondOffset) < 0
+		if !afterFirst || !beforeSecond || !messageAllowedInHistory(record.msg, options.Events, options.Reactions) {
+			return false, nil
+		}
+		history = append(history, record.msg)
+		if !reverse && len(history) == options.Limit {
+			return true, nil
+		}
+		return false, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if reverse && len(history) > options.Limit {
+		history = history[len(history)-options.Limit:]
+	}
+	return history, nil
+}
+
+func (ms *fsMessageStore) parseHistoryID(id string, options *LoadMessageOptions) (time.Time, int64, error) {
+	networkID, entity, date, offset, err := parseFSMsgID(id)
+	if err != nil {
+		return time.Time{}, 0, err
+	}
+	if networkID != options.Network.ID || entity != options.Entity {
+		return time.Time{}, 0, fmt.Errorf("cannot find message ID: message ID doesn't match network/entity")
+	}
+	return date, offset, nil
+}
+
+func (ms *fsMessageStore) LoadBeforeID(ctx context.Context, id string, options *LoadMessageOptions) ([]*irc.Message, error) {
+	date, offset, err := ms.parseHistoryID(id, options)
+	if err != nil {
+		return nil, err
+	}
+	return ms.loadIDRange(ctx, time.Time{}, 0, date, offset, true, options)
+}
+
+func (ms *fsMessageStore) LoadAfterID(ctx context.Context, id string, options *LoadMessageOptions) ([]*irc.Message, error) {
+	date, offset, err := ms.parseHistoryID(id, options)
+	if err != nil {
+		return nil, err
+	}
+	return ms.loadIDRange(ctx, date, offset, time.Time{}, 0, false, options)
+}
+
+func (ms *fsMessageStore) LoadBetweenID(ctx context.Context, first, second string, options *LoadMessageOptions) ([]*irc.Message, error) {
+	firstDate, firstOffset, err := ms.parseHistoryID(first, options)
+	if err != nil {
+		return nil, err
+	}
+	secondDate, secondOffset, err := ms.parseHistoryID(second, options)
+	if err != nil {
+		return nil, err
+	}
+	if compareFSPosition(firstDate, firstOffset, secondDate, secondOffset) < 0 {
+		return ms.loadIDRange(ctx, firstDate, firstOffset, secondDate, secondOffset, false, options)
+	}
+	return ms.loadIDRange(ctx, secondDate, secondOffset, firstDate, firstOffset, true, options)
+}
+
+type fsHistoryBound struct {
+	timestamp time.Time
+	date      time.Time
+	offset    int64
+	exact     bool
+}
+
+func (ms *fsMessageStore) resolveHistoryBound(bound HistoryBound, options *LoadMessageOptions) (fsHistoryBound, error) {
+	resolved := fsHistoryBound{timestamp: bound.Timestamp}
+	if bound.ID == "" {
+		return resolved, nil
+	}
+	date, offset, err := ms.parseHistoryID(bound.ID, options)
+	if err != nil {
+		return fsHistoryBound{}, err
+	}
+	resolved.date = date
+	resolved.offset = offset
+	resolved.exact = true
+	return resolved, nil
+}
+
+func compareFSRecordToBound(record fsHistoryRecord, bound fsHistoryBound) int {
+	if bound.exact {
+		return compareFSPosition(record.date, record.offset, bound.date, bound.offset)
+	}
+	if record.timestamp.Before(bound.timestamp) {
+		return -1
+	}
+	if record.timestamp.After(bound.timestamp) {
+		return 1
+	}
+	return 0
+}
+
+func compareFSBounds(first, second fsHistoryBound) int {
+	if first.timestamp.Before(second.timestamp) {
+		return -1
+	}
+	if first.timestamp.After(second.timestamp) {
+		return 1
+	}
+	if first.exact && second.exact {
+		return compareFSPosition(first.date, first.offset, second.date, second.offset)
+	}
+	if first.exact {
+		return 1
+	}
+	if second.exact {
+		return -1
+	}
+	return 0
+}
+
+func (ms *fsMessageStore) LoadBetween(ctx context.Context, first, second HistoryBound, options *LoadMessageOptions) ([]*irc.Message, error) {
+	firstBound, err := ms.resolveHistoryBound(first, options)
+	if err != nil {
+		return nil, err
+	}
+	secondBound, err := ms.resolveHistoryBound(second, options)
+	if err != nil {
+		return nil, err
+	}
+	forward := compareFSBounds(firstBound, secondBound) < 0
+	lower, upper := firstBound, secondBound
+	if !forward {
+		lower, upper = secondBound, firstBound
+	}
+
+	var history []*irc.Message
+	err = ms.walkHistory(ctx, options.Network, options.Entity, func(record fsHistoryRecord) (bool, error) {
+		if compareFSRecordToBound(record, lower) <= 0 ||
+			compareFSRecordToBound(record, upper) >= 0 ||
+			!messageAllowedInHistory(record.msg, options.Events, options.Reactions) {
+			return false, nil
+		}
+		history = append(history, record.msg)
+		if forward && len(history) == options.Limit {
+			return true, nil
+		}
+		return false, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !forward && len(history) > options.Limit {
+		history = history[len(history)-options.Limit:]
+	}
+	return history, nil
+}
+
 func (ms *fsMessageStore) ListTargets(ctx context.Context, network *database.Network, start, end time.Time, limit int, events bool) ([]ChatHistoryTarget, error) {
 	start = start.In(time.Local)
 	end = end.In(time.Local)
@@ -531,7 +795,7 @@ func (ms *fsMessageStore) Search(ctx context.Context, network *database.Network,
 		if opts.From != "" && m.Name != opts.From {
 			return false
 		}
-		if text != "" && !strings.Contains(strings.ToLower(m.Params[1]), text) {
+		if text != "" && (len(m.Params) < 2 || !strings.Contains(strings.ToLower(m.Params[1]), text)) {
 			return false
 		}
 		return true

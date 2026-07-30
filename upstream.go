@@ -35,6 +35,7 @@ var permanentUpstreamCaps = map[string]bool{
 	"away-notify":      true,
 	"batch":            true,
 	"chghost":          true,
+	"echo-message":     true,
 	"extended-join":    true,
 	"extended-monitor": true,
 	"invite-notify":    true,
@@ -48,15 +49,19 @@ var permanentUpstreamCaps = map[string]bool{
 	"draft/account-registration": true,
 	"draft/extended-monitor":     true,
 	"draft/message-redaction":    true,
+	"draft/multiline":            true,
 }
 
 // storableMessageTags is the static list of message tags that will cause
 // a TAGMSG to be stored.
 var storableMessageTags = map[string]bool{
+	"+react":   true,
+	"+unreact": true,
+
 	"+draft/react":   true,
-	"+react":         true,
 	"+draft/unreact": true,
-	"+unreact":       true,
+	"+draft/reply":   true,
+	"+reply":         true,
 }
 
 type registrationError struct {
@@ -120,10 +125,12 @@ func (uc *upstreamChannel) updateAutoDetach(dur time.Duration) {
 }
 
 type upstreamBatch struct {
-	Type   string
-	Params []string
-	Outer  *upstreamBatch // if not-nil, this batch is nested in Outer
-	Label  string
+	Type                 string
+	Params               []string
+	Outer                *upstreamBatch // if not-nil, this batch is nested in Outer
+	Label                string
+	lastTime             time.Time
+	metadataDownstreamID uint64
 }
 
 type upstreamUser struct {
@@ -211,20 +218,21 @@ type upstreamConn struct {
 	availableMemberships  []xirc.Membership
 	isupport              map[string]*string
 
-	registered  bool
-	nick        string
-	username    string
-	realname    string
-	hostname    string
-	modes       userModes
-	channels    xirc.CaseMappingMap[*upstreamChannel]
-	users       xirc.CaseMappingMap[*upstreamUser]
-	caps        xirc.CapRegistry
-	batches     map[string]upstreamBatch
-	away        bool
-	account     string
-	nextLabelID uint64
-	monitored   xirc.CaseMappingMap[bool]
+	registered    bool
+	nick          string
+	username      string
+	realname      string
+	hostname      string
+	modes         userModes
+	channels      xirc.CaseMappingMap[*upstreamChannel]
+	users         xirc.CaseMappingMap[*upstreamUser]
+	caps          xirc.CapRegistry
+	batches       map[string]upstreamBatch
+	away          bool
+	manualMessage string
+	account       string
+	nextLabelID   uint64
+	monitored     xirc.CaseMappingMap[bool]
 
 	saslClient  sasl.Client
 	saslStarted bool
@@ -234,6 +242,9 @@ type upstreamConn struct {
 	// been sent yet.
 	pendingCmds map[string][]pendingUpstreamCommand
 
+	metadataPublishPending  map[string]*string
+	metadataPublishDelivery map[string]metadataPublishDelivery
+
 	pendingRegainNick string
 	regainNickTimer   *time.Timer
 	regainNickBackoff *backoffer
@@ -242,6 +253,14 @@ type upstreamConn struct {
 
 	hasDesiredNick bool
 }
+
+type metadataPublishDelivery struct {
+	target    string
+	value     *string
+	broadcast bool
+}
+
+const metadataPublishFallbackDelay = 75 * time.Millisecond
 
 func connectToUpstream(ctx context.Context, network *network) (*upstreamConn, error) {
 	logger := &prefixLogger{network.user.logger, fmt.Sprintf("upstream %q: ", network.GetName())}
@@ -443,16 +462,295 @@ func (uc *upstreamConn) isOurNick(nick string) bool {
 	return uc.network.equalCasemap(uc.nick, nick)
 }
 
+func (uc *upstreamConn) botMode() (byte, bool) {
+	bot := uc.isupport["BOT"]
+	if bot == nil || len(*bot) != 1 {
+		return 0, false
+	}
+	return (*bot)[0], true
+}
+
+func (uc *upstreamConn) addBotTag(msg *irc.Message) *irc.Message {
+	botMode, ok := uc.botMode()
+	if !ok || !uc.modes.Has(botMode) || msg.Prefix == nil || !uc.isOurNick(msg.Prefix.Name) {
+		return msg
+	}
+
+	msg = msg.Copy()
+	if msg.Tags == nil {
+		msg.Tags = make(irc.Tags)
+	}
+	msg.Tags["bot"] = ""
+	return msg
+}
+
+func (uc *upstreamConn) updateCachedBotMode(nick string, enabled bool) {
+	botMode, ok := uc.botMode()
+	if !ok {
+		return
+	}
+
+	uu := uc.users.Get(nick)
+	if uu == nil || uu.Flags == "" {
+		return
+	}
+
+	flags := uu.Flags
+	if enabled {
+		if strings.IndexByte(flags, botMode) < 0 {
+			flags += string(botMode)
+		}
+	} else {
+		flags = strings.ReplaceAll(flags, string(botMode), "")
+	}
+	uc.cacheUserInfo(nick, &upstreamUser{Flags: flags})
+}
+
 func (uc *upstreamConn) forwardMessage(ctx context.Context, msg *irc.Message) {
+	msg = uc.addBotTag(msg)
 	uc.forEachDownstream(func(dc *downstreamConn) {
 		dc.SendMessage(ctx, msg)
 	})
 }
 
 func (uc *upstreamConn) forwardMsgByID(ctx context.Context, id uint64, msg *irc.Message) {
+	msg = uc.addBotTag(msg)
 	uc.forEachDownstreamByID(id, func(dc *downstreamConn) {
 		dc.SendMessage(ctx, msg)
 	})
+}
+
+func (uc *upstreamConn) forwardMetadataMessage(ctx context.Context, msg *irc.Message) {
+	uc.forEachDownstream(func(dc *downstreamConn) {
+		if dc.hasMetadataCap() {
+			dc.SendMessage(ctx, convertMetadataMessage(msg, uc.metadataVersion(), dc.metadataVersion(), dc.nick, true))
+		}
+	})
+}
+
+func (uc *upstreamConn) forwardMetadataMsgByID(ctx context.Context, id uint64, msg *irc.Message) {
+	uc.forEachDownstreamByID(id, func(dc *downstreamConn) {
+		if dc.hasMetadataCap() {
+			dc.SendMessage(ctx, convertMetadataMessage(msg, uc.metadataVersion(), dc.metadataVersion(), dc.nick, false))
+		}
+	})
+}
+
+func (uc *upstreamConn) syncNetworkMetadata(ctx context.Context) {
+	if !uc.hasMetadataCap() {
+		return
+	}
+	metadata, err := uc.srv.db.ListNetworkMetadata(ctx, uc.network.ID)
+	if err != nil {
+		uc.logger.Printf("failed to list network metadata for sync: %v", err)
+		return
+	}
+	for _, md := range metadata {
+		value := md.Value
+		uc.SendMessage(ctx, &irc.Message{
+			Command: "METADATA",
+			Params:  []string{"*", "SET", md.Key, value},
+		})
+	}
+}
+
+func (uc *upstreamConn) storeNetworkMetadataFromMessage(ctx context.Context, msg *irc.Message) (self, changed bool) {
+	if len(msg.Params) < 3 {
+		return false, false
+	}
+	target, key := msg.Params[0], strings.ToLower(msg.Params[1])
+	if !uc.isSelfMetadataTarget(target) || !isMetadataKey(key) {
+		return false, false
+	}
+	var value *string
+	if len(msg.Params) > 3 {
+		value = &msg.Params[3]
+	}
+	_, _, _, changed = uc.storeNetworkMetadataValue(ctx, target, key, value)
+	return true, changed
+}
+
+func (uc *upstreamConn) storeNetworkMetadataFromKeyValue(ctx context.Context, msg *irc.Message) {
+	if len(msg.Params) < 4 {
+		return
+	}
+	target, key := msg.Params[1], strings.ToLower(msg.Params[2])
+	if !uc.isSelfMetadataTarget(target) || !isMetadataKey(key) {
+		return
+	}
+	var value *string
+	if len(msg.Params) > 4 {
+		value = &msg.Params[4]
+	}
+	uc.storeNetworkMetadata(ctx, key, value)
+}
+
+func (uc *upstreamConn) deleteNetworkMetadataFromKeyNotSet(ctx context.Context, msg *irc.Message) {
+	if len(msg.Params) < 4 {
+		return
+	}
+	target, key := msg.Params[1], strings.ToLower(msg.Params[2])
+	if !uc.isSelfMetadataTarget(target) || !isMetadataKey(key) {
+		return
+	}
+	uc.storeNetworkMetadata(ctx, key, nil)
+}
+
+func (uc *upstreamConn) isSelfMetadataTarget(target string) bool {
+	return target == "*" || uc.isOurNick(target)
+}
+
+func (uc *upstreamConn) storeNetworkMetadata(ctx context.Context, key string, value *string) {
+	if err := uc.srv.db.StoreNetworkMetadata(ctx, uc.network.ID, key, value); err != nil {
+		uc.logger.Printf("failed to store network metadata %q: %v", key, err)
+	}
+}
+
+// storeNetworkMetadataReply records a successful self-metadata mutation and
+// reports whether it changed the value already known to the bouncer.
+func (uc *upstreamConn) storeNetworkMetadataReply(ctx context.Context, msg *irc.Message) (string, string, *string, bool) {
+	if len(msg.Params) < 4 || !uc.isSelfMetadataTarget(msg.Params[1]) {
+		return "", "", nil, false
+	}
+	key := strings.ToLower(msg.Params[2])
+	if !isMetadataKey(key) {
+		return "", "", nil, false
+	}
+	var value *string
+	if msg.Command == xirc.RPL_KEYVALUE {
+		if len(msg.Params) < 5 {
+			return "", "", nil, false
+		}
+		value = &msg.Params[4]
+	}
+	return uc.storeNetworkMetadataValue(ctx, msg.Params[1], key, value)
+}
+
+func metadataValuesEqual(a, b *string) bool {
+	return a == nil && b == nil || a != nil && b != nil && *a == *b
+}
+
+func metadataPublishResultValue(msg *irc.Message) *string {
+	if msg.Command != xirc.RPL_KEYVALUE || len(msg.Params) < 5 {
+		return nil
+	}
+	return &msg.Params[4]
+}
+
+func copyMetadataValue(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func (uc *upstreamConn) rememberMetadataPublishDelivery(target, key string, value *string, broadcast bool) {
+	if uc.metadataPublishDelivery == nil {
+		uc.metadataPublishDelivery = make(map[string]metadataPublishDelivery)
+	}
+	uc.metadataPublishDelivery[key] = metadataPublishDelivery{
+		target:    target,
+		value:     copyMetadataValue(value),
+		broadcast: broadcast,
+	}
+}
+
+func (uc *upstreamConn) consumeMetadataPublishDelivery(key string, value *string) (metadataPublishDelivery, bool) {
+	delivery, ok := uc.metadataPublishDelivery[key]
+	if !ok || !metadataValuesEqual(delivery.value, value) {
+		return metadataPublishDelivery{}, false
+	}
+	delete(uc.metadataPublishDelivery, key)
+	return delivery, true
+}
+
+func (uc *upstreamConn) scheduleMetadataPublishFallback(target, key string, value *string) {
+	event := eventMetadataPublishFallback{
+		uc:     uc,
+		target: target,
+		key:    key,
+		value:  copyMetadataValue(value),
+	}
+	time.AfterFunc(metadataPublishFallbackDelay, func() {
+		select {
+		case uc.user.events <- event:
+		case <-uc.network.stopped:
+		}
+	})
+}
+
+func (uc *upstreamConn) handleMetadataPublishFallback(ctx context.Context, target, key string, value *string) {
+	if uc.isClosed() || uc.network.conn != uc {
+		return
+	}
+	delivery, ok := uc.metadataPublishDelivery[key]
+	if !ok || delivery.broadcast || delivery.target != target || !metadataValuesEqual(delivery.value, value) {
+		return
+	}
+	if !uc.srv.Config().MetadataClientSync {
+		return
+	}
+	delivery.broadcast = true
+	uc.metadataPublishDelivery[key] = delivery
+	uc.forwardNetworkMetadataChange(ctx, target, key, value)
+}
+
+func (uc *upstreamConn) storeNetworkMetadataValue(ctx context.Context, target, key string, value *string) (string, string, *string, bool) {
+	metadata, err := uc.srv.db.ListNetworkMetadata(ctx, uc.network.ID)
+	if err != nil {
+		uc.logger.Printf("failed to list network metadata %q: %v", key, err)
+		return "", "", nil, false
+	}
+	found := false
+	for _, md := range metadata {
+		if md.Key == key {
+			found = true
+			if value != nil && md.Value == *value {
+				return target, key, value, false
+			}
+			break
+		}
+	}
+	if !found && value == nil {
+		return target, key, value, false
+	}
+	uc.storeNetworkMetadata(ctx, key, value)
+	return target, key, value, true
+}
+
+func (uc *upstreamConn) forwardNetworkMetadataChange(ctx context.Context, target, key string, value *string) {
+	msg := metadataNotification(uc.metadataVersion(), uc.nick, target, key, value)
+	uc.forEachDownstream(func(dc *downstreamConn) {
+		if dc.hasMetadataCap() {
+			dc.SendMessage(ctx, convertMetadataMessage(msg, uc.metadataVersion(), dc.metadataVersion(), dc.nick, true))
+		}
+	})
+}
+
+func isMetadataBatchType(typ string) bool {
+	return typ == "metadata" || typ == "metadata-subs"
+}
+
+func upstreamBatchTarget(batch *upstreamBatch) string {
+	for b := batch; b != nil; b = b.Outer {
+		switch b.Type {
+		case "draft/multiline":
+			if len(b.Params) > 0 {
+				return b.Params[0]
+			}
+		}
+	}
+	return ""
+}
+
+func (uc *upstreamConn) updateBatchTime(name string, t time.Time) {
+	batch, ok := uc.batches[name]
+	if !ok || !t.After(batch.lastTime) {
+		return
+	}
+	batch.lastTime = t
+	uc.batches[name] = batch
 }
 
 func (uc *upstreamConn) abortPendingCommands() {
@@ -492,6 +790,11 @@ func (uc *upstreamConn) abortPendingCommands() {
 					Command: irc.ERR_SASLABORTED,
 					Params:  []string{dc.nick, "SASL authentication aborted"},
 				})
+			case "METADATA":
+				dc.SendMessage(ctx, &irc.Message{
+					Command: "FAIL",
+					Params:  []string{"METADATA", "TEMPORARILY_UNAVAILABLE", "*", "Command aborted"},
+				})
 			case "REGISTER", "VERIFY":
 				dc.SendMessage(ctx, &irc.Message{
 					Command: "FAIL",
@@ -526,7 +829,7 @@ func (uc *upstreamConn) enqueueCommand(ctx context.Context, dc *downstreamConn, 
 	}
 
 	switch msg.Command {
-	case "LIST", "WHO", "WHOIS", "AUTHENTICATE", "REGISTER", "VERIFY":
+	case "LIST", "WHO", "WHOIS", "AUTHENTICATE", "REGISTER", "VERIFY", "METADATA":
 		// Supported
 	default:
 		panic(fmt.Errorf("Unsupported pending command %q", msg.Command))
@@ -618,6 +921,25 @@ func (uc *upstreamConn) parseLabel(label string) (downstreamID uint64, downstrea
 	return
 }
 
+func isSnomaskMessage(msg *irc.Message) bool {
+	if msg.Prefix != nil && msg.Prefix.User == "" && msg.Prefix.Host == "" {
+		return true
+	}
+
+	if len(msg.Params) > 0 && msg.Params[0] == "*" {
+		return true
+	}
+
+	switch msg.Command {
+	case "WALLOPS", "GLOBOPS", "LOCOPS", "NOTICE":
+		if len(msg.Params) > 0 && msg.Params[0] == "*" {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (uc *upstreamConn) handleMessage(ctx context.Context, msg *irc.Message) error {
 	var label string
 	if l, ok := msg.Tags["label"]; ok {
@@ -629,7 +951,8 @@ func (uc *upstreamConn) handleMessage(ctx context.Context, msg *irc.Message) err
 	var batchName string
 	batchLabel := false
 	if bn, ok := msg.Tags["batch"]; ok {
-		batchName = bn
+		batchName = "u-" + bn
+		msg.Tags["batch"] = batchName
 		b, ok := uc.batches[batchName]
 		if !ok {
 			return fmt.Errorf("unexpected batch reference: batch was not defined: %q", batchName)
@@ -639,19 +962,34 @@ func (uc *upstreamConn) handleMessage(ctx context.Context, msg *irc.Message) err
 			batchLabel = true
 			label = msgBatch.Label
 		}
-		delete(msg.Tags, "batch")
 	}
 
 	downstreamID, downstreamLabel, err := uc.parseLabel(label)
 	if err != nil {
 		return err
 	}
+	metadataPublishReply := downstreamID == 0 && downstreamLabel == "metadata-publish"
+	isMetadataPublishResult := (msg.Command == xirc.RPL_KEYVALUE || msg.Command == xirc.RPL_KEYNOTSET) && len(msg.Params) >= 3
+	isMetadataPublishFailure := msg.Command == "FAIL" && len(msg.Params) >= 3 && strings.EqualFold(msg.Params[0], "METADATA")
+	if !metadataPublishReply && downstreamID == 0 && (isMetadataPublishResult || isMetadataPublishFailure) {
+		key := strings.ToLower(msg.Params[2])
+		if _, ok := uc.metadataPublishPending[key]; ok {
+			metadataPublishReply = true
+		}
+	}
+	if metadataPublishReply && len(msg.Params) >= 3 {
+		key := strings.ToLower(msg.Params[2])
+		pendingValue, ok := uc.metadataPublishPending[key]
+		if isMetadataPublishFailure || ok && metadataValuesEqual(pendingValue, metadataPublishResultValue(msg)) {
+			delete(uc.metadataPublishPending, key)
+		}
+	}
 	if downstreamID != 0 {
 		if batchLabel {
 			// label comes from batch, send the message as part of that batch
+			// messages within a batch don't get a label
 			uc.forEachDownstreamByID(downstreamID, func(dc *downstreamConn) {
 				ctx = downstreamLabelContextWith(ctx, dc.id, &downstreamLabelContext{
-					label: downstreamLabel,
 					batch: batchName,
 				})
 			})
@@ -674,12 +1012,16 @@ func (uc *upstreamConn) handleMessage(ctx context.Context, msg *irc.Message) err
 		msg.Prefix = uc.serverPrefix
 	}
 
-	if !isNumeric(msg.Command) {
+	if !isNumeric(msg.Command) && msg.Tags["batch"] == "" {
 		t, err := time.Parse(xirc.ServerTimeLayout, string(msg.Tags["time"]))
 		if err != nil {
 			t = time.Now()
 		}
 		msg.Tags["time"] = uc.user.FormatServerTime(t)
+	}
+	msgTime, _ := time.Parse(xirc.ServerTimeLayout, string(msg.Tags["time"]))
+	if msg.Command != "BATCH" && batchName != "" {
+		uc.updateBatchTime(batchName, msgTime)
 	}
 
 	switch msg.Command {
@@ -689,6 +1031,78 @@ func (uc *upstreamConn) handleMessage(ctx context.Context, msg *irc.Message) err
 			Params:  msg.Params,
 		})
 		return nil
+	case "METADATA":
+		self, changed := uc.storeNetworkMetadataFromMessage(ctx, msg)
+		if self {
+			defer uc.reconcileLastActiveMetadata(ctx)
+			key := strings.ToLower(msg.Params[1])
+			var value *string
+			if len(msg.Params) > 3 {
+				value = &msg.Params[3]
+			}
+			if delivery, ok := uc.consumeMetadataPublishDelivery(key, value); ok {
+				if delivery.broadcast {
+					return nil
+				}
+			} else if !changed {
+				return nil
+			}
+		}
+		if target := upstreamBatchTarget(msgBatch); target != "" {
+			uc.produce(ctx, target, msg, downstreamID)
+		} else {
+			uc.forwardMetadataMessage(ctx, msg)
+		}
+	case "760", "761", "766", "770", "771", "772", "774":
+		if msg.Command == xirc.RPL_KEYVALUE || msg.Command == xirc.RPL_KEYNOTSET {
+			defer uc.reconcileLastActiveMetadata(ctx)
+		}
+		pendingMetadataReply := downstreamID != 0 || metadataPublishReply
+		if !pendingMetadataReply {
+			dc, _ := uc.currentPendingCommand("METADATA")
+			pendingMetadataReply = dc != nil
+		}
+		if !pendingMetadataReply && msgBatch != nil && isMetadataBatchType(msgBatch.Type) && msgBatch.metadataDownstreamID != 0 {
+			pendingMetadataReply = true
+		}
+		if pendingMetadataReply && (msg.Command == xirc.RPL_KEYVALUE || msg.Command == xirc.RPL_KEYNOTSET) {
+			if target, key, value, changed := uc.storeNetworkMetadataReply(ctx, msg); changed {
+				uc.rememberMetadataPublishDelivery(target, key, value, false)
+				if uc.srv.Config().MetadataClientSync {
+					uc.scheduleMetadataPublishFallback(target, key, value)
+				}
+			}
+		} else if !pendingMetadataReply && msg.Command == xirc.RPL_KEYVALUE {
+			uc.storeNetworkMetadataFromKeyValue(ctx, msg)
+		} else if !pendingMetadataReply && msg.Command == xirc.RPL_KEYNOTSET {
+			uc.deleteNetworkMetadataFromKeyNotSet(ctx, msg)
+		}
+		if metadataPublishReply {
+			// Internal last-active publishes become a shared state notification,
+			// not an unsolicited command reply to one downstream client.
+		} else if downstreamID != 0 {
+			dc := uc.downstreamByID(downstreamID)
+			if dc == nil || !dc.rootMetadataCompatActive.Load() || dc.rootMetadataCompatReplied.Swap(true) {
+				uc.forwardMetadataMsgByID(ctx, downstreamID, msg)
+			} else {
+				dc.SendMessage(ctx, convertMetadataMessage(msg, uc.metadataVersion(), dc.metadataVersion(), dc.nick, false))
+			}
+			if dc != nil && dc.rootMetadataCompatActive.Load() && dc.rootMetadataCompatRemaining.Add(-1) == 0 {
+				dc.rootMetadataCompatActive.Store(false)
+			}
+		} else if msgBatch != nil && isMetadataBatchType(msgBatch.Type) && msgBatch.metadataDownstreamID != 0 {
+			uc.forwardMetadataMsgByID(ctx, msgBatch.metadataDownstreamID, msg)
+		} else if dc, _ := uc.currentPendingCommand("METADATA"); dc != nil {
+			dc.SendMessage(ctx, convertMetadataMessage(msg, uc.metadataVersion(), dc.metadataVersion(), dc.nick, false))
+		} else {
+			uc.forwardMetadataMessage(ctx, msg)
+		}
+		if pendingMetadataReply && !metadataPublishReply && msgBatch == nil {
+			switch msg.Command {
+			case "760", "761", "766", "770", "771", "774":
+				uc.dequeueCommand("METADATA")
+			}
+		}
 	case "NOTICE", "PRIVMSG", "TAGMSG", "REDACT":
 		isText := msg.Command == "NOTICE" || msg.Command == "PRIVMSG"
 
@@ -753,7 +1167,7 @@ func (uc *upstreamConn) handleMessage(ctx context.Context, msg *irc.Message) err
 			}
 		}
 
-		sendWebPush := !self && !detached && isText && (highlight || directMessage)
+		sendWebPush := !self && !detached && isText && (highlight || directMessage) && !isSnomaskMessage(msg)
 
 		sourceCM := uc.network.casemap(msg.Prefix.Name)
 		mt, err := uc.srv.db.GetMessageTarget(ctx, uc.network.ID, sourceCM)
@@ -1022,6 +1436,7 @@ func (uc *upstreamConn) handleMessage(ctx context.Context, msg *irc.Message) err
 		uc.registered = true
 		uc.serverPrefix = msg.Prefix
 		uc.logger.Printf("connection registered with nick %q", uc.nick)
+		uc.syncNetworkMetadata(ctx)
 	case irc.RPL_MYINFO:
 		if err := parseMessageParams(msg, nil, &uc.serverName, nil, &uc.availableUserModes, nil); err != nil {
 			return err
@@ -1124,13 +1539,19 @@ func (uc *upstreamConn) handleMessage(ctx context.Context, msg *irc.Message) err
 
 		uc.forwardMsgByID(ctx, downstreamID, msg)
 	case "BATCH":
-		var tag string
-		if err := parseMessageParams(msg, &tag); err != nil {
-			return err
+		var target string
+		if len(msg.Params) < 1 || len(msg.Params[0]) <= 1 {
+			return newNeedMoreParamsError(msg.Command)
 		}
+		// first, we prefix the upstream batch tag so it doesn't collide with soju's
+		batchSort := msg.Params[0][0]
+		tag := "u-" + msg.Params[0][1:]
+		msg.Params[0] = string(batchSort) + tag
 
-		if strings.HasPrefix(tag, "+") {
-			tag = tag[1:]
+		var batch upstreamBatch
+
+		switch batchSort {
+		case '+':
 			if _, ok := uc.batches[tag]; ok {
 				return fmt.Errorf("unexpected BATCH reference tag: batch was already defined: %q", tag)
 			}
@@ -1142,50 +1563,52 @@ func (uc *upstreamConn) handleMessage(ctx context.Context, msg *irc.Message) err
 			if label == "" && msgBatch != nil {
 				label = msgBatch.Label
 			}
-			uc.batches[tag] = upstreamBatch{
-				Type:   batchType,
-				Params: msg.Params[2:],
-				Outer:  msgBatch,
-				Label:  label,
+			batch = upstreamBatch{
+				Type:     batchType,
+				Params:   msg.Params[2:],
+				Outer:    msgBatch,
+				Label:    label,
+				lastTime: msgTime,
 			}
-			if downstreamID != 0 && downstreamLabel != "" {
-				uc.forEachDownstreamByID(downstreamID, func(dc *downstreamConn) {
-					if labelCtx := downstreamLabelContextFrom(ctx, dc.id); labelCtx != nil {
-						labelCtx.label = ""
-					}
-					dc.SendMessage(ctx, &irc.Message{
-						Prefix:  uc.srv.prefix(),
-						Command: "BATCH",
-						Params:  msg.Params,
-						Tags: irc.Tags{
-							"label": downstreamLabel,
-						},
-					})
-				})
+			if isMetadataBatchType(batchType) {
+				if dc, _ := uc.currentPendingCommand("METADATA"); dc != nil {
+					batch.metadataDownstreamID = dc.id
+				}
 			}
-		} else if strings.HasPrefix(tag, "-") {
-			tag = tag[1:]
-			if _, ok := uc.batches[tag]; !ok {
+			uc.batches[tag] = batch
+		case '-':
+			var ok bool
+			if batch, ok = uc.batches[tag]; !ok {
 				return fmt.Errorf("unknown BATCH reference tag: %q", tag)
 			}
-			label := uc.batches[tag].Label
 			delete(uc.batches, tag)
-
-			// BATCH - does not have @label/@batch attached to it, so downstreamID is empty.
-			// extract it back from the batch struct.
-			downstreamID, downstreamLabel, err := uc.parseLabel(label)
-			if downstreamID != 0 && downstreamLabel != "" && err == nil {
-				uc.forEachDownstreamByID(downstreamID, func(dc *downstreamConn) {
-					dc.SendMessage(ctx, &irc.Message{
-						Prefix:  uc.srv.prefix(),
-						Command: "BATCH",
-						Params:  msg.Params,
-					})
-				})
+			if batch.lastTime.After(msgTime) {
+				msgTime = batch.lastTime
+				msg.Tags["time"] = uc.user.FormatServerTime(msgTime)
 			}
-		} else {
+			if isMetadataBatchType(batch.Type) && batch.metadataDownstreamID != 0 {
+				uc.dequeueCommand("METADATA")
+			}
+		default:
 			return fmt.Errorf("unexpected BATCH reference tag: missing +/- prefix: %q", tag)
 		}
+		if batchName != "" {
+			uc.updateBatchTime(batchName, msgTime)
+		}
+
+		if batch.Type == "draft/multiline" && len(batch.Params) < 1 {
+			return newNeedMoreParamsError(msg.Command)
+		}
+		target = upstreamBatchTarget(&batch)
+		ch := uc.network.channels.Get(target)
+		if ch != nil {
+			if ch.Detached {
+				uc.handleDetachedMessage(ctx, ch, msg)
+				return nil
+			}
+		}
+
+		uc.produce(ctx, target, msg, downstreamID)
 	case "NICK":
 		var newNick string
 		if err := parseMessageParams(msg, &newNick); err != nil {
@@ -1455,6 +1878,9 @@ func (uc *upstreamConn) handleMessage(ctx context.Context, msg *irc.Message) err
 
 			if err := uc.modes.Apply(modeStr); err != nil {
 				return err
+			}
+			if botMode, ok := uc.botMode(); ok {
+				uc.updateCachedBotMode(uc.nick, uc.modes.Has(botMode))
 			}
 
 			uc.forwardMessage(ctx, msg)
@@ -1898,6 +2324,9 @@ func (uc *upstreamConn) handleMessage(ctx context.Context, msg *irc.Message) err
 		if err := parseMessageParams(msg, &command, &code); err != nil {
 			return err
 		}
+		if metadataPublishReply {
+			return nil
+		}
 
 		if !uc.registered && command == "*" && code == "ACCOUNT_REQUIRED" {
 			return registrationError{msg}
@@ -2048,6 +2477,32 @@ func (uc *upstreamConn) updateCaps(ctx context.Context) {
 		}
 	}
 
+	var wantedMetadataCap string
+	if uc.caps.IsAvailable("draft/metadata-3") {
+		wantedMetadataCap = "draft/metadata-3"
+	} else if uc.caps.IsAvailable("draft/metadata-2") {
+		wantedMetadataCap = "draft/metadata-2"
+	}
+	for _, name := range metadataCapNames {
+		enabled := uc.caps.IsEnabled(name)
+		if name == wantedMetadataCap {
+			if !enabled {
+				requestCaps = append(requestCaps, name)
+			}
+		} else if enabled {
+			requestCaps = append(requestCaps, "-"+name)
+		}
+	}
+	// Metadata-2 delivers asynchronous changes through its companion
+	// notification capability. Without it, SET replies work but other
+	// downstream clients never receive the resulting metadata update.
+	metadataNotifyCap := "draft/metadata-notify-2"
+	if wantedMetadataCap == "draft/metadata-2" && uc.caps.IsAvailable(metadataNotifyCap) && !uc.caps.IsEnabled(metadataNotifyCap) {
+		requestCaps = append(requestCaps, metadataNotifyCap)
+	} else if wantedMetadataCap != "draft/metadata-2" && uc.caps.IsEnabled(metadataNotifyCap) {
+		requestCaps = append(requestCaps, "-"+metadataNotifyCap)
+	}
+
 	echoMessage := uc.caps.IsAvailable("labeled-response")
 	if !uc.caps.IsEnabled("echo-message") && echoMessage {
 		requestCaps = append(requestCaps, "echo-message")
@@ -2122,7 +2577,7 @@ func (uc *upstreamConn) handleCapAck(ctx context.Context, name string, ok bool) 
 		})
 	case "echo-message":
 	default:
-		if permanentUpstreamCaps[name] {
+		if permanentUpstreamCaps[name] || isMetadataCap(name) {
 			break
 		}
 		uc.logger.Printf("received CAP ACK/NAK for a cap we don't support: %v", name)
@@ -2219,6 +2674,10 @@ func (uc *upstreamConn) SendMessage(ctx context.Context, msg *irc.Message) {
 
 func (uc *upstreamConn) SendMessageLabeled(ctx context.Context, downstreamID uint64, msg *irc.Message) {
 	var label string
+	if msg.Tags["label"] == "" && msg.Tags["batch"] != "" {
+		// We shouldn't add a label to a message in a batch. Only the batch command should receive a label.
+		goto send
+	}
 	if labelCtx := downstreamLabelContextFrom(ctx, downstreamID); labelCtx != nil {
 		if labelCtx.pendingMsg != nil || labelCtx.batch != "" {
 			panic("called both downstreamConn.SendMessage and upstreamConn.SendMessage with the same label")
@@ -2231,6 +2690,28 @@ func (uc *upstreamConn) SendMessageLabeled(ctx context.Context, downstreamID uin
 			msg.Tags = make(irc.Tags)
 		}
 		msg.Tags["label"] = fmt.Sprintf("sd-%d-%d-%s", downstreamID, uc.nextLabelID, label)
+		uc.nextLabelID++
+	}
+send:
+	uc.SendMessage(ctx, msg)
+}
+
+func (uc *upstreamConn) SendMetadataPublish(ctx context.Context, msg *irc.Message) {
+	if len(msg.Params) >= 3 {
+		if uc.metadataPublishPending == nil {
+			uc.metadataPublishPending = make(map[string]*string)
+		}
+		var value *string
+		if len(msg.Params) > 3 {
+			value = &msg.Params[3]
+		}
+		uc.metadataPublishPending[strings.ToLower(msg.Params[2])] = copyMetadataValue(value)
+	}
+	if uc.caps.IsEnabled("labeled-response") {
+		if msg.Tags == nil {
+			msg.Tags = make(irc.Tags)
+		}
+		msg.Tags["label"] = fmt.Sprintf("sd-0-%d-metadata-publish", uc.nextLabelID)
 		uc.nextLabelID++
 	}
 	uc.SendMessage(ctx, msg)
@@ -2247,7 +2728,7 @@ func (uc *upstreamConn) appendLog(ctx context.Context, entity string, msg *irc.M
 	if msg.Command == "TAGMSG" {
 		store := false
 		for tag := range msg.Tags {
-			if storableMessageTags[tag] {
+			if storableMessageTags[tag] || storableMessageTags["+"+tag] {
 				store = true
 				break
 			}
@@ -2304,6 +2785,7 @@ func (uc *upstreamConn) produce(ctx context.Context, target string, msg *irc.Mes
 	if target != "" {
 		msgID = uc.appendLog(ctx, target, msg)
 	}
+	msg = uc.addBotTag(msg)
 
 	// Don't forward messages if it's a detached channel
 	ch := uc.network.channels.Get(target)
@@ -2352,6 +2834,22 @@ func (uc *upstreamConn) updateAway(ctx context.Context) {
 		})
 	}
 	uc.away = away
+}
+
+func (uc *upstreamConn) setManualAway(ctx context.Context, isAway bool, reason string) {
+	if isAway {
+		uc.SendMessage(ctx, &irc.Message{
+			Command: "AWAY",
+			Params:  []string{reason},
+		})
+	} else {
+		uc.SendMessage(ctx, &irc.Message{
+			Command: "AWAY",
+		})
+	}
+
+	uc.away = isAway
+	uc.manualMessage = reason
 }
 
 func (uc *upstreamConn) updateChannelAutoDetach(name string) {

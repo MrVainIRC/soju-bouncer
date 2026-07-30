@@ -109,4 +109,23 @@ var postgresMigrations = []string{
 		);
 	`,
 	`ALTER TABLE "DeviceCertificate" ADD COLUMN last_ip TEXT NOT NULL DEFAULT ''`,
+	`
+		CREATE TABLE "NetworkMetadata" (
+			network INTEGER NOT NULL REFERENCES "Network"(id) ON DELETE CASCADE,
+			key TEXT NOT NULL,
+			value TEXT NOT NULL,
+			UNIQUE(network, key)
+		);
+		CREATE INDEX "NetworkMetadata_network_index" ON "NetworkMetadata" (network);
+	`,
+	`
+		CREATE TABLE "ClientNetworkMetadata" (
+			network INTEGER NOT NULL REFERENCES "Network"(id) ON DELETE CASCADE,
+			client TEXT NOT NULL,
+			key TEXT NOT NULL,
+			value TEXT NOT NULL,
+			UNIQUE(network, client, key)
+		);
+		CREATE INDEX "ClientNetworkMetadata_network_client_index" ON "ClientNetworkMetadata" (network, client);
+	`,
 }

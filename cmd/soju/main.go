@@ -181,11 +181,11 @@ func main() {
 				return tlsCert.Load().(*tls.Certificate), nil
 			},
 			GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
-				cfg := *tlsCfg // copy
+				cfg := tlsCfg.Clone()
 				if !srv.Config().ClientCertAuth {
 					cfg.ClientAuth = tls.NoClientCert
 				}
-				return &cfg, nil
+				return cfg, nil
 			},
 		}
 	}

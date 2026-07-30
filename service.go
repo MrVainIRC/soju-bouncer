@@ -74,6 +74,39 @@ func sendServicePRIVMSG(ctx context.Context, dc *downstreamConn, text string) {
 	})
 }
 
+func sendServicePRIVMSGLines(ctx context.Context, dc *downstreamConn, lines []string) {
+	if len(lines) == 0 {
+		return
+	}
+	if len(lines) == 1 || !dc.caps.IsEnabled("batch") || !dc.caps.IsEnabled("draft/multiline") {
+		for _, line := range lines {
+			sendServicePRIVMSG(ctx, dc, line)
+		}
+		return
+	}
+
+	dc.SendBatch(ctx, "draft/multiline", []string{dc.nick}, nil, func(batchRef string) {
+		for _, line := range lines {
+			dc.SendMessage(ctx, &irc.Message{
+				Tags:    irc.Tags{"batch": batchRef},
+				Prefix:  servicePrefix,
+				Command: "PRIVMSG",
+				Params:  []string{dc.nick, line},
+			})
+		}
+	})
+}
+
+func (ctx *serviceContext) printLines(lines []string) {
+	if ctx.dc != nil {
+		sendServicePRIVMSGLines(ctx, ctx.dc, lines)
+		return
+	}
+	for _, line := range lines {
+		ctx.print(line)
+	}
+}
+
 func splitWords(s string) ([]string, error) {
 	var words []string
 	var lastWord strings.Builder
@@ -149,9 +182,11 @@ func handleServiceCommand(ctx *serviceContext, words []string) error {
 
 	if cmd.handle == nil {
 		if len(cmd.children) > 0 {
-			var l []string
-			appendServiceCommandSetHelp(cmd.children, words, ctx.admin, ctx.user == nil, &l)
-			ctx.print("available commands: " + strings.Join(l, ", "))
+			lines := formatServiceCommandSetHelp(cmd.children, words, ctx.admin, ctx.user == nil)
+			if len(lines) == 0 {
+				return fmt.Errorf("command %q not found", words[0])
+			}
+			ctx.printLines(lines)
 			return nil
 		}
 		// Pretend the command does not exist if it has neither children nor handler.
@@ -392,23 +427,55 @@ func init() {
 	}
 }
 
-func appendServiceCommandSetHelp(cmds serviceCommandSet, prefix []string, admin bool, global bool, l *[]string) {
+func serviceCommandVisible(cmd *serviceCommand, admin bool, global bool) bool {
+	if cmd.admin && !admin {
+		return false
+	}
+	if !cmd.global && global {
+		return false
+	}
+	return true
+}
+
+func serviceCommandUsage(words []string, cmd *serviceCommand) string {
+	s := strings.Join(words, " ")
+	if cmd.usage != "" {
+		s += " " + cmd.usage
+	}
+	return s
+}
+
+func appendServiceCommandSetHelpLines(cmds serviceCommandSet, prefix []string, admin bool, global bool, lines *[]string) {
 	for _, name := range cmds.Names() {
 		cmd := cmds[name]
-		if cmd.admin && !admin {
+		if !serviceCommandVisible(cmd, admin, global) {
 			continue
 		}
-		if !cmd.global && global {
+		words := append(append([]string(nil), prefix...), name)
+		if len(cmd.children) > 0 {
+			appendServiceCommandSetHelpLines(cmd.children, words, admin, global, lines)
 			continue
 		}
-		words := append(prefix, name)
-		if len(cmd.children) == 0 {
-			s := strings.Join(words, " ")
-			*l = append(*l, s)
-		} else {
-			appendServiceCommandSetHelp(cmd.children, words, admin, global, l)
+
+		line := "  " + serviceCommandUsage(words, cmd)
+		if cmd.desc != "" {
+			line += " - " + cmd.desc
 		}
+		*lines = append(*lines, line)
 	}
+}
+
+func formatServiceCommandSetHelp(cmds serviceCommandSet, prefix []string, admin bool, global bool) []string {
+	title := "BouncerServ commands"
+	if len(prefix) > 0 {
+		title = "BouncerServ " + strings.Join(prefix, " ") + " commands"
+	}
+	lines := []string{title}
+	appendServiceCommandSetHelpLines(cmds, prefix, admin, global, &lines)
+	if len(lines) == 1 {
+		return nil
+	}
+	return lines
 }
 
 func handleServiceHelp(ctx *serviceContext, params []string) error {
@@ -418,24 +485,27 @@ func handleServiceHelp(ctx *serviceContext, params []string) error {
 			return err
 		}
 		words := params[:len(params)-len(rest)]
+		if !serviceCommandVisible(cmd, ctx.admin, ctx.user == nil) {
+			return fmt.Errorf("command %q not found", strings.Join(words, " "))
+		}
 
 		if len(cmd.children) > 0 {
-			var l []string
-			appendServiceCommandSetHelp(cmd.children, words, ctx.admin, ctx.user == nil, &l)
-			ctx.print("available commands: " + strings.Join(l, ", "))
-		} else {
-			text := strings.Join(words, " ")
-			if cmd.usage != "" {
-				text += " " + cmd.usage
+			lines := formatServiceCommandSetHelp(cmd.children, words, ctx.admin, ctx.user == nil)
+			if len(lines) == 0 {
+				return fmt.Errorf("command %q not found", strings.Join(words, " "))
 			}
-			text += ": " + cmd.desc
-
-			ctx.print(text)
+			ctx.printLines(lines)
+		} else {
+			lines := []string{
+				"Usage: " + serviceCommandUsage(words, cmd),
+			}
+			if cmd.desc != "" {
+				lines = append(lines, cmd.desc)
+			}
+			ctx.printLines(lines)
 		}
 	} else {
-		var l []string
-		appendServiceCommandSetHelp(serviceCommands, nil, ctx.admin, ctx.user == nil, &l)
-		ctx.print("available commands: " + strings.Join(l, ", "))
+		ctx.printLines(formatServiceCommandSetHelp(serviceCommands, nil, ctx.admin, ctx.user == nil))
 	}
 	return nil
 }

@@ -2,6 +2,7 @@ package msgstore
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"codeberg.org/emersion/soju/database"
@@ -17,11 +18,14 @@ func (dbMsgID) msgIDType() msgIDType {
 	return msgIDDB
 }
 
-func parseDBMsgID(s string) (msgID int64, err error) {
+func parseDBMsgIDForOptions(s string, options *LoadMessageOptions) (int64, error) {
 	var id dbMsgID
-	_, _, err = ParseMsgID(s, &id)
+	networkID, entity, err := ParseMsgID(s, &id)
 	if err != nil {
 		return 0, err
+	}
+	if networkID != options.Network.ID || entity != options.Entity {
+		return 0, fmt.Errorf("cannot find message ID: message ID doesn't match network/entity")
 	}
 	return int64(id.ID), nil
 }
@@ -64,20 +68,22 @@ func (ms *dbMessageStore) LastMsgID(ctx context.Context, network *database.Netwo
 }
 
 func (ms *dbMessageStore) LoadLatestID(ctx context.Context, id string, options *LoadMessageOptions) ([]*irc.Message, error) {
-	msgID, err := parseDBMsgID(id)
+	msgID, err := parseDBMsgIDForOptions(id, options)
 	if err != nil {
 		return nil, err
 	}
 
 	l, err := ms.db.ListMessages(ctx, options.Network.ID, options.Entity, &database.MessageOptions{
-		AfterID:  msgID,
-		Limit:    options.Limit,
-		TakeLast: true,
+		AfterID:   msgID,
+		Limit:     options.Limit,
+		Events:    options.Events,
+		Reactions: options.Reactions,
+		TakeLast:  true,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return l, nil
+	return filterHistoryMessages(l, options.Events, options.Reactions), nil
 }
 
 func (ms *dbMessageStore) Append(ctx context.Context, network *database.Network, entity string, msg *irc.Message) (string, error) {
@@ -86,6 +92,104 @@ func (ms *dbMessageStore) Append(ctx context.Context, network *database.Network,
 		return "", err
 	}
 	return formatDBMsgID(network.ID, entity, ids[0]), nil
+}
+
+func (ms *dbMessageStore) ResolveMsgID(ctx context.Context, network *database.Network, entity, msgID string) (string, *irc.Message, error) {
+	id, msg, err := ms.db.GetMessageIDByMsgID(ctx, network.ID, entity, msgID)
+	if err != nil {
+		return "", nil, err
+	}
+	if id == 0 {
+		return "", nil, fmt.Errorf("cannot find message ID")
+	}
+	return formatDBMsgID(network.ID, entity, id), msg, nil
+}
+
+func (ms *dbMessageStore) loadIDRange(ctx context.Context, afterID, beforeID int64, takeLast bool, options *LoadMessageOptions) ([]*irc.Message, error) {
+	l, err := ms.db.ListMessages(ctx, options.Network.ID, options.Entity, &database.MessageOptions{
+		AfterID:   afterID,
+		BeforeID:  beforeID,
+		Limit:     options.Limit,
+		Events:    options.Events,
+		Reactions: options.Reactions,
+		TakeLast:  takeLast,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return filterHistoryMessages(l, options.Events, options.Reactions), nil
+}
+
+func (ms *dbMessageStore) LoadBeforeID(ctx context.Context, id string, options *LoadMessageOptions) ([]*irc.Message, error) {
+	beforeID, err := parseDBMsgIDForOptions(id, options)
+	if err != nil {
+		return nil, err
+	}
+	return ms.loadIDRange(ctx, 0, beforeID, true, options)
+}
+
+func (ms *dbMessageStore) LoadAfterID(ctx context.Context, id string, options *LoadMessageOptions) ([]*irc.Message, error) {
+	afterID, err := parseDBMsgIDForOptions(id, options)
+	if err != nil {
+		return nil, err
+	}
+	return ms.loadIDRange(ctx, afterID, 0, false, options)
+}
+
+func (ms *dbMessageStore) LoadBetweenID(ctx context.Context, first, second string, options *LoadMessageOptions) ([]*irc.Message, error) {
+	firstID, err := parseDBMsgIDForOptions(first, options)
+	if err != nil {
+		return nil, err
+	}
+	secondID, err := parseDBMsgIDForOptions(second, options)
+	if err != nil {
+		return nil, err
+	}
+	if firstID < secondID {
+		return ms.loadIDRange(ctx, firstID, secondID, false, options)
+	}
+	return ms.loadIDRange(ctx, secondID, firstID, true, options)
+}
+
+func (ms *dbMessageStore) LoadBetween(ctx context.Context, first, second HistoryBound, options *LoadMessageOptions) ([]*irc.Message, error) {
+	var firstID, secondID int64
+	var err error
+	if first.ID != "" {
+		firstID, err = parseDBMsgIDForOptions(first.ID, options)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if second.ID != "" {
+		secondID, err = parseDBMsgIDForOptions(second.ID, options)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	forward := first.Timestamp.Before(second.Timestamp) ||
+		(first.Timestamp.Equal(second.Timestamp) && firstID < secondID)
+	lower, upper := first, second
+	lowerID, upperID := firstID, secondID
+	if !forward {
+		lower, upper = second, first
+		lowerID, upperID = secondID, firstID
+	}
+
+	l, err := ms.db.ListMessages(ctx, options.Network.ID, options.Entity, &database.MessageOptions{
+		AfterTime:        lower.Timestamp,
+		BeforeTime:       upper.Timestamp,
+		AfterPositionID:  lowerID,
+		BeforePositionID: upperID,
+		Limit:            options.Limit,
+		Events:           options.Events,
+		Reactions:        options.Reactions,
+		TakeLast:         !forward,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return filterHistoryMessages(l, options.Events, options.Reactions), nil
 }
 
 func (ms *dbMessageStore) ListTargets(ctx context.Context, network *database.Network, start, end time.Time, limit int, events bool) ([]ChatHistoryTarget, error) {
@@ -126,12 +230,13 @@ func (ms *dbMessageStore) LoadBeforeTime(ctx context.Context, start, end time.Ti
 		BeforeTime: start,
 		Limit:      options.Limit,
 		Events:     options.Events,
+		Reactions:  options.Reactions,
 		TakeLast:   true,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return l, nil
+	return filterHistoryMessages(l, options.Events, options.Reactions), nil
 }
 
 func (ms *dbMessageStore) LoadAfterTime(ctx context.Context, start, end time.Time, options *LoadMessageOptions) ([]*irc.Message, error) {
@@ -140,11 +245,12 @@ func (ms *dbMessageStore) LoadAfterTime(ctx context.Context, start, end time.Tim
 		BeforeTime: end,
 		Limit:      options.Limit,
 		Events:     options.Events,
+		Reactions:  options.Reactions,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return l, nil
+	return filterHistoryMessages(l, options.Events, options.Reactions), nil
 }
 
 func (ms *dbMessageStore) Search(ctx context.Context, network *database.Network, options *SearchMessageOptions) ([]*irc.Message, error) {

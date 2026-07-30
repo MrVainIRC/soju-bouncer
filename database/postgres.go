@@ -681,6 +681,116 @@ func (db *PostgresDB) StoreReadReceipt(ctx context.Context, networkID int64, rec
 	return err
 }
 
+func (db *PostgresDB) ListNetworkMetadata(ctx context.Context, networkID int64) ([]NetworkMetadata, error) {
+	ctx, cancel := context.WithTimeout(ctx, postgresQueryTimeout)
+	defer cancel()
+
+	rows, err := db.db.QueryContext(ctx, `
+		SELECT key, value
+		FROM "NetworkMetadata"
+		WHERE network = $1
+		ORDER BY key`, networkID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var metadata []NetworkMetadata
+	for rows.Next() {
+		var md NetworkMetadata
+		if err := rows.Scan(&md.Key, &md.Value); err != nil {
+			return nil, err
+		}
+		metadata = append(metadata, md)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return metadata, nil
+}
+
+func (db *PostgresDB) StoreNetworkMetadata(ctx context.Context, networkID int64, key string, value *string) error {
+	ctx, cancel := context.WithTimeout(ctx, postgresQueryTimeout)
+	defer cancel()
+
+	if value == nil {
+		_, err := db.db.ExecContext(ctx, `
+			DELETE FROM "NetworkMetadata"
+			WHERE network = $1 AND key = $2`, networkID, key)
+		return err
+	}
+
+	_, err := db.db.ExecContext(ctx, `
+		INSERT INTO "NetworkMetadata"(network, key, value)
+		VALUES ($1, $2, $3)
+		ON CONFLICT(network, key) DO UPDATE SET value = excluded.value`,
+		networkID, key, *value)
+	return err
+}
+
+func (db *PostgresDB) ClearNetworkMetadata(ctx context.Context, networkID int64) error {
+	ctx, cancel := context.WithTimeout(ctx, postgresQueryTimeout)
+	defer cancel()
+
+	_, err := db.db.ExecContext(ctx, `
+		DELETE FROM "NetworkMetadata"
+		WHERE network = $1`, networkID)
+	return err
+}
+
+func (db *PostgresDB) ListClientNetworkMetadata(ctx context.Context, networkID int64, client string) ([]NetworkMetadata, error) {
+	ctx, cancel := context.WithTimeout(ctx, postgresQueryTimeout)
+	defer cancel()
+
+	rows, err := db.db.QueryContext(ctx, `
+		SELECT key, value
+		FROM "ClientNetworkMetadata"
+		WHERE network = $1 AND client = $2
+		ORDER BY key`, networkID, client)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var metadata []NetworkMetadata
+	for rows.Next() {
+		var md NetworkMetadata
+		if err := rows.Scan(&md.Key, &md.Value); err != nil {
+			return nil, err
+		}
+		metadata = append(metadata, md)
+	}
+	return metadata, rows.Err()
+}
+
+func (db *PostgresDB) StoreClientNetworkMetadata(ctx context.Context, networkID int64, client, key string, value *string) error {
+	ctx, cancel := context.WithTimeout(ctx, postgresQueryTimeout)
+	defer cancel()
+
+	if value == nil {
+		_, err := db.db.ExecContext(ctx, `
+			DELETE FROM "ClientNetworkMetadata"
+			WHERE network = $1 AND client = $2 AND key = $3`, networkID, client, key)
+		return err
+	}
+	_, err := db.db.ExecContext(ctx, `
+		INSERT INTO "ClientNetworkMetadata"(network, client, key, value)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT(network, client, key) DO UPDATE SET value = excluded.value`,
+		networkID, client, key, *value)
+	return err
+}
+
+func (db *PostgresDB) ClearClientNetworkMetadata(ctx context.Context, networkID int64, client string) error {
+	ctx, cancel := context.WithTimeout(ctx, postgresQueryTimeout)
+	defer cancel()
+
+	_, err := db.db.ExecContext(ctx, `
+		DELETE FROM "ClientNetworkMetadata"
+		WHERE network = $1 AND client = $2`, networkID, client)
+	return err
+}
+
 func (db *PostgresDB) listTopNetworkAddrs(ctx context.Context) (map[string]int, error) {
 	ctx, cancel := context.WithTimeout(ctx, postgresQueryTimeout)
 	defer cancel()
@@ -830,7 +940,7 @@ func (db *PostgresDB) GetMessageLastID(ctx context.Context, networkID int64, nam
 			SELECT id FROM "MessageTarget"
 			WHERE network = $1 AND target = $2
 		)
-		ORDER BY time DESC LIMIT 1`,
+		ORDER BY time DESC, id DESC LIMIT 1`,
 		networkID,
 		name,
 	)
@@ -841,6 +951,42 @@ func (db *PostgresDB) GetMessageLastID(ctx context.Context, networkID int64, nam
 		return 0, err
 	}
 	return msgID, nil
+}
+
+func (db *PostgresDB) GetMessageIDByMsgID(ctx context.Context, networkID int64, name, msgID string) (int64, *irc.Message, error) {
+	ctx, cancel := context.WithTimeout(ctx, postgresQueryTimeout)
+	defer cancel()
+
+	rows, err := db.db.QueryContext(ctx, `
+		SELECT id, raw FROM "Message"
+		WHERE target = (
+			SELECT id FROM "MessageTarget"
+			WHERE network = $1 AND target = $2
+		)
+		ORDER BY id ASC`,
+		networkID,
+		name,
+	)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id int64
+		var raw string
+		if err := rows.Scan(&id, &raw); err != nil {
+			return 0, nil, err
+		}
+		msg, err := irc.ParseMessage(raw)
+		if err != nil {
+			return 0, nil, err
+		}
+		if msg.Tags["msgid"] == msgID {
+			return id, msg, nil
+		}
+	}
+	return 0, nil, rows.Err()
 }
 
 func (db *PostgresDB) GetMessageTarget(ctx context.Context, networkID int64, target string) (*MessageTarget, error) {
@@ -965,6 +1111,9 @@ func (db *PostgresDB) StoreMessages(ctx context.Context, networkID int64, name s
 				text.Valid = true
 				text.String = stripANSI(msg.Params[1])
 			}
+		case "TAGMSG", "METADATA", "BATCH":
+			text.Valid = true
+			text.String = ""
 		}
 
 		raw := msg.String()
@@ -1002,22 +1151,31 @@ func (db *PostgresDB) ListMessageLastPerTarget(ctx context.Context, networkID in
 	`
 
 	if !options.Events {
-		query += `AND m.text IS NOT NULL `
+		query += `AND m.text IS NOT NULL AND (
+			m.raw LIKE '% PRIVMSG %' OR m.raw LIKE 'PRIVMSG %' OR
+			m.raw LIKE '% NOTICE %' OR m.raw LIKE 'NOTICE %'
+		) `
 	}
 
 	query += `
 
-			ORDER BY m.time DESC LIMIT 1
+			ORDER BY m.time DESC, m.id DESC LIMIT 1
 		) AS l ON t.id = l.target
 		WHERE t.network = $1
 	`
 
-	if !options.AfterTime.IsZero() {
+	if options.AfterPositionID > 0 {
+		parameters = append(parameters, options.AfterTime, options.AfterPositionID)
+		query += fmt.Sprintf(`AND (time > $%d OR (time = $%d AND id > $%d)) `, len(parameters)-1, len(parameters)-1, len(parameters))
+	} else if !options.AfterTime.IsZero() {
 		// compares time strings by lexicographical order
 		parameters = append(parameters, options.AfterTime)
 		query += fmt.Sprintf(`AND l.latest > $%d `, len(parameters))
 	}
-	if !options.BeforeTime.IsZero() {
+	if options.BeforePositionID > 0 {
+		parameters = append(parameters, options.BeforeTime, options.BeforePositionID)
+		query += fmt.Sprintf(`AND (time < $%d OR (time = $%d AND id < $%d)) `, len(parameters)-1, len(parameters)-1, len(parameters))
+	} else if !options.BeforeTime.IsZero() {
 		// compares time strings by lexicographical order
 		parameters = append(parameters, options.BeforeTime)
 		query += fmt.Sprintf(`AND l.latest < $%d `, len(parameters))
@@ -1078,6 +1236,10 @@ func (db *PostgresDB) ListMessages(ctx context.Context, networkID int64, name st
 		parameters = append(parameters, options.AfterID)
 		query += fmt.Sprintf(`AND id > $%d `, len(parameters))
 	}
+	if options.BeforeID > 0 {
+		parameters = append(parameters, options.BeforeID)
+		query += fmt.Sprintf(`AND id < $%d `, len(parameters))
+	}
 	if !options.AfterTime.IsZero() {
 		// compares time strings by lexicographical order
 		parameters = append(parameters, options.AfterTime)
@@ -1097,12 +1259,21 @@ func (db *PostgresDB) ListMessages(ctx context.Context, networkID int64, name st
 		query += fmt.Sprintf(`AND text_search @@ plainto_tsquery('search_simple', $%d) `, len(parameters))
 	}
 	if !options.Events {
-		query += `AND text IS NOT NULL `
+		query += `AND text IS NOT NULL AND (
+			raw LIKE '% PRIVMSG %' OR raw LIKE 'PRIVMSG %' OR
+			raw LIKE '% NOTICE %' OR raw LIKE 'NOTICE %' OR
+			raw LIKE '% BATCH %' OR raw LIKE 'BATCH %' `
+		if options.Reactions {
+			query += `OR ((raw LIKE '% TAGMSG %' OR raw LIKE 'TAGMSG %') AND (
+				raw LIKE '%+react%' OR raw LIKE '%+draft/react%' OR
+				raw LIKE '%+unreact%' OR raw LIKE '%+draft/unreact%')) `
+		}
+		query += `) `
 	}
 	if options.TakeLast {
-		query += `ORDER BY time DESC `
+		query += `ORDER BY time DESC, id DESC `
 	} else {
-		query += `ORDER BY time ASC `
+		query += `ORDER BY time ASC, id ASC `
 	}
 	parameters = append(parameters, options.Limit)
 	query += fmt.Sprintf(`LIMIT $%d`, len(parameters))

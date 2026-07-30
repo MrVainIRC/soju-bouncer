@@ -1,6 +1,7 @@
 package znclog
 
 import (
+	"encoding/base64"
 	"fmt"
 	"strings"
 	"time"
@@ -11,17 +12,49 @@ import (
 	"codeberg.org/emersion/soju/xirc"
 )
 
-var timestampPrefixLen = len("[01:02:03] ")
-
 func UnmarshalLine(line string, user *database.User, network *database.Network, entity string, ref time.Time, events bool) (*irc.Message, time.Time, error) {
-	var hour, minute, second int
-	_, err := fmt.Sscanf(line, "[%02d:%02d:%02d] ", &hour, &minute, &second)
-	if err != nil {
-		return nil, time.Time{}, fmt.Errorf("malformed timestamp prefix: %v", err)
-	} else if len(line) < timestampPrefixLen {
-		return nil, time.Time{}, fmt.Errorf("malformed timestamp prefix: too short")
+	end := strings.Index(line, "] ")
+	if end < 0 {
+		return nil, time.Time{}, fmt.Errorf("malformed timestamp prefix")
 	}
-	line = line[timestampPrefixLen:]
+	var hour, minute, second, millisecond int
+	n, err := fmt.Sscanf(line[:end+1], "[%02d:%02d:%02d.%03d]", &hour, &minute, &second, &millisecond)
+	if err != nil {
+		n, err = fmt.Sscanf(line[:end+1], "[%02d:%02d:%02d]", &hour, &minute, &second)
+		if err != nil || n != 3 {
+			return nil, time.Time{}, fmt.Errorf("malformed timestamp prefix: %v", err)
+		}
+	} else if n != 4 {
+		return nil, time.Time{}, fmt.Errorf("malformed timestamp prefix")
+	}
+	line = line[end+2:]
+
+	year, month, day := ref.Date()
+	t := time.Date(year, month, day, hour, minute, second, millisecond*int(time.Millisecond), time.Local)
+
+	if raw, ok := strings.CutPrefix(line, rawMessagePrefix); ok {
+		b, err := base64.RawStdEncoding.DecodeString(raw)
+		if err != nil {
+			return nil, time.Time{}, fmt.Errorf("malformed raw message: %v", err)
+		}
+		msg, err := irc.ParseMessage(string(b))
+		if err != nil {
+			return nil, time.Time{}, fmt.Errorf("malformed raw IRC message: %v", err)
+		}
+		if msg.Tags == nil {
+			msg.Tags = make(map[string]string)
+		}
+		if tag, ok := msg.Tags["time"]; ok {
+			parsed, err := time.Parse(xirc.ServerTimeLayout, tag)
+			if err != nil {
+				return nil, time.Time{}, fmt.Errorf("malformed raw message time tag: %v", err)
+			}
+			t = parsed.In(time.Local)
+		} else {
+			msg.Tags["time"] = xirc.FormatServerTime(t)
+		}
+		return msg, t, nil
+	}
 
 	var cmd string
 	var prefix *irc.Prefix
@@ -146,9 +179,6 @@ func UnmarshalLine(line string, user *database.User, network *database.Network, 
 		}
 		params = []string{entity, text}
 	}
-
-	year, month, day := ref.Date()
-	t := time.Date(year, month, day, hour, minute, second, 0, time.Local)
 
 	msg := &irc.Message{
 		Tags: map[string]string{

@@ -22,10 +22,59 @@ const (
 )
 
 type LoadMessageOptions struct {
-	Network *database.Network
-	Entity  string
-	Limit   int
-	Events  bool
+	Network   *database.Network
+	Entity    string
+	Limit     int
+	Events    bool
+	Reactions bool
+}
+
+func isReactionEvent(msg *irc.Message) bool {
+	if msg.Command != "TAGMSG" {
+		return false
+	}
+	_, react := msg.Tags["+react"]
+	_, draftReact := msg.Tags["+draft/react"]
+	_, unreact := msg.Tags["+unreact"]
+	_, draftUnreact := msg.Tags["+draft/unreact"]
+	return react || draftReact || unreact || draftUnreact
+}
+
+func messageAllowedInHistory(msg *irc.Message, events, reactions bool) bool {
+	if events {
+		return true
+	}
+	if reactions && isReactionEvent(msg) {
+		return true
+	}
+	switch msg.Command {
+	case "PRIVMSG", "NOTICE", "BATCH":
+		return true
+	default:
+		return false
+	}
+}
+
+func MessageAllowedInHistory(msg *irc.Message, events, reactions bool) bool {
+	return messageAllowedInHistory(msg, events, reactions)
+}
+
+func filterHistoryMessages(messages []*irc.Message, events, reactions bool) []*irc.Message {
+	if events {
+		return messages
+	}
+	for _, msg := range messages {
+		if !messageAllowedInHistory(msg, events, reactions) {
+			filtered := messages[:0]
+			for _, msg := range messages {
+				if messageAllowedInHistory(msg, events, reactions) {
+					filtered = append(filtered, msg)
+				}
+			}
+			return filtered
+		}
+	}
+	return messages
 }
 
 // Store is a per-user store for IRC messages.
@@ -46,9 +95,24 @@ type ChatHistoryTarget struct {
 	LatestMessage time.Time
 }
 
+type HistoryBound struct {
+	Timestamp time.Time
+	ID        string
+}
+
 // ChatHistoryStore is a message store that supports chat history operations.
 type ChatHistoryStore interface {
 	Store
+
+	// ResolveMsgID resolves an IRC msgid tag to a stable store-specific cursor.
+	ResolveMsgID(ctx context.Context, network *database.Network, entity, msgID string) (string, *irc.Message, error)
+	// LoadBeforeID and LoadAfterID exclude the referenced message.
+	LoadBeforeID(ctx context.Context, id string, options *LoadMessageOptions) ([]*irc.Message, error)
+	LoadAfterID(ctx context.Context, id string, options *LoadMessageOptions) ([]*irc.Message, error)
+	// LoadBetweenID excludes both referenced messages and preserves their direction.
+	LoadBetweenID(ctx context.Context, first, second string, options *LoadMessageOptions) ([]*irc.Message, error)
+	// LoadBetween accepts independently resolved msgid or timestamp bounds.
+	LoadBetween(ctx context.Context, first, second HistoryBound, options *LoadMessageOptions) ([]*irc.Message, error)
 
 	// ListTargets lists channels and nicknames by time of the latest message.
 	// It returns up to limit targets, starting from start and ending on end,

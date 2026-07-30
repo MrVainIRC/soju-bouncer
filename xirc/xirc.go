@@ -40,6 +40,7 @@ const (
 
 	// https://ircv3.net/specs/extensions/metadata
 	RPL_KEYVALUE        = "761"
+	RPL_KEYNOTSET       = "766"
 	RPL_METADATASUBOK   = "770"
 	RPL_METADATAUNSUBOK = "771"
 	RPL_METADATASUBS    = "772"

@@ -83,7 +83,7 @@ func (ms *memoryMessageStore) LastMsgID(ctx context.Context, network *database.N
 
 func (ms *memoryMessageStore) Append(ctx context.Context, network *database.Network, entity string, msg *irc.Message) (string, error) {
 	switch msg.Command {
-	case "PRIVMSG", "NOTICE":
+	case "PRIVMSG", "NOTICE", "TAGMSG", "METADATA", "BATCH":
 		// Only append these messages, because LoadLatestID shouldn't return
 		// other kinds of message.
 	default:
@@ -102,10 +102,6 @@ func (ms *memoryMessageStore) Append(ctx context.Context, network *database.Netw
 }
 
 func (ms *memoryMessageStore) LoadLatestID(ctx context.Context, id string, options *LoadMessageOptions) ([]*irc.Message, error) {
-	if options.Events {
-		return nil, fmt.Errorf("events are unsupported for memory message store")
-	}
-
 	_, _, seq, err := parseMemoryMsgID(id)
 	if err != nil {
 		return nil, err
@@ -117,7 +113,11 @@ func (ms *memoryMessageStore) LoadLatestID(ctx context.Context, id string, optio
 		return nil, nil
 	}
 
-	return rb.LoadLatestSeq(seq, options.Limit)
+	history, err := rb.LoadLatestSeq(seq, options.Limit)
+	if err != nil {
+		return nil, err
+	}
+	return filterHistoryMessages(history, options.Events, options.Reactions), nil
 }
 
 type messageRingBuffer struct {

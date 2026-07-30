@@ -374,6 +374,26 @@ func (db *SqliteDB) DeleteUser(ctx context.Context, id int64) error {
 		return err
 	}
 
+	_, err = tx.ExecContext(ctx, `DELETE FROM NetworkMetadata
+		WHERE network IN (
+			SELECT id
+			FROM Network
+			WHERE user = ?
+		)`, id)
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.ExecContext(ctx, `DELETE FROM ClientNetworkMetadata
+		WHERE network IN (
+			SELECT id
+			FROM Network
+			WHERE user = ?
+		)`, id)
+	if err != nil {
+		return err
+	}
+
 	_, err = tx.ExecContext(ctx, `DELETE FROM DeviceCertificate
 		WHERE user = ?`, id)
 	if err != nil {
@@ -552,6 +572,16 @@ func (db *SqliteDB) DeleteNetwork(ctx context.Context, id int64) error {
 	}
 
 	_, err = tx.ExecContext(ctx, "DELETE FROM ReadReceipt WHERE network = ?", id)
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.ExecContext(ctx, "DELETE FROM NetworkMetadata WHERE network = ?", id)
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.ExecContext(ctx, "DELETE FROM ClientNetworkMetadata WHERE network = ?", id)
 	if err != nil {
 		return err
 	}
@@ -871,6 +901,116 @@ func (db *SqliteDB) StoreReadReceipt(ctx context.Context, networkID int64, recei
 	return err
 }
 
+func (db *SqliteDB) ListNetworkMetadata(ctx context.Context, networkID int64) ([]NetworkMetadata, error) {
+	ctx, cancel := context.WithTimeout(ctx, sqliteQueryTimeout)
+	defer cancel()
+
+	rows, err := db.db.QueryContext(ctx, `
+		SELECT key, value
+		FROM NetworkMetadata
+		WHERE network = ?
+		ORDER BY key`, networkID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var metadata []NetworkMetadata
+	for rows.Next() {
+		var md NetworkMetadata
+		if err := rows.Scan(&md.Key, &md.Value); err != nil {
+			return nil, err
+		}
+		metadata = append(metadata, md)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return metadata, nil
+}
+
+func (db *SqliteDB) StoreNetworkMetadata(ctx context.Context, networkID int64, key string, value *string) error {
+	ctx, cancel := context.WithTimeout(ctx, sqliteQueryTimeout)
+	defer cancel()
+
+	if value == nil {
+		_, err := db.db.ExecContext(ctx, `
+			DELETE FROM NetworkMetadata
+			WHERE network = ? AND key = ?`, networkID, key)
+		return err
+	}
+
+	_, err := db.db.ExecContext(ctx, `
+		INSERT INTO NetworkMetadata(network, key, value)
+		VALUES (?, ?, ?)
+		ON CONFLICT(network, key) DO UPDATE SET value = excluded.value`,
+		networkID, key, *value)
+	return err
+}
+
+func (db *SqliteDB) ClearNetworkMetadata(ctx context.Context, networkID int64) error {
+	ctx, cancel := context.WithTimeout(ctx, sqliteQueryTimeout)
+	defer cancel()
+
+	_, err := db.db.ExecContext(ctx, `
+		DELETE FROM NetworkMetadata
+		WHERE network = ?`, networkID)
+	return err
+}
+
+func (db *SqliteDB) ListClientNetworkMetadata(ctx context.Context, networkID int64, client string) ([]NetworkMetadata, error) {
+	ctx, cancel := context.WithTimeout(ctx, sqliteQueryTimeout)
+	defer cancel()
+
+	rows, err := db.db.QueryContext(ctx, `
+		SELECT key, value
+		FROM ClientNetworkMetadata
+		WHERE network = ? AND client = ?
+		ORDER BY key`, networkID, client)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var metadata []NetworkMetadata
+	for rows.Next() {
+		var md NetworkMetadata
+		if err := rows.Scan(&md.Key, &md.Value); err != nil {
+			return nil, err
+		}
+		metadata = append(metadata, md)
+	}
+	return metadata, rows.Err()
+}
+
+func (db *SqliteDB) StoreClientNetworkMetadata(ctx context.Context, networkID int64, client, key string, value *string) error {
+	ctx, cancel := context.WithTimeout(ctx, sqliteQueryTimeout)
+	defer cancel()
+
+	if value == nil {
+		_, err := db.db.ExecContext(ctx, `
+			DELETE FROM ClientNetworkMetadata
+			WHERE network = ? AND client = ? AND key = ?`, networkID, client, key)
+		return err
+	}
+	_, err := db.db.ExecContext(ctx, `
+		INSERT INTO ClientNetworkMetadata(network, client, key, value)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(network, client, key) DO UPDATE SET value = excluded.value`,
+		networkID, client, key, *value)
+	return err
+}
+
+func (db *SqliteDB) ClearClientNetworkMetadata(ctx context.Context, networkID int64, client string) error {
+	ctx, cancel := context.WithTimeout(ctx, sqliteQueryTimeout)
+	defer cancel()
+
+	_, err := db.db.ExecContext(ctx, `
+		DELETE FROM ClientNetworkMetadata
+		WHERE network = ? AND client = ?`, networkID, client)
+	return err
+}
+
 func (db *SqliteDB) ListWebPushConfigs(ctx context.Context) ([]WebPushConfig, error) {
 	ctx, cancel := context.WithTimeout(ctx, sqliteQueryTimeout)
 	defer cancel()
@@ -1009,7 +1149,7 @@ func (db *SqliteDB) GetMessageLastID(ctx context.Context, networkID int64, name 
 	row := db.db.QueryRowContext(ctx, `
 		SELECT m.id FROM Message AS m, MessageTarget AS t
 		WHERE t.network = :network AND t.target = :target AND m.target = t.id
-		ORDER BY m.time DESC LIMIT 1`,
+		ORDER BY m.time DESC, m.id DESC LIMIT 1`,
 		sql.Named("network", networkID),
 		sql.Named("target", name),
 	)
@@ -1020,6 +1160,39 @@ func (db *SqliteDB) GetMessageLastID(ctx context.Context, networkID int64, name 
 		return 0, err
 	}
 	return msgID, nil
+}
+
+func (db *SqliteDB) GetMessageIDByMsgID(ctx context.Context, networkID int64, name, msgID string) (int64, *irc.Message, error) {
+	ctx, cancel := context.WithTimeout(ctx, sqliteQueryTimeout)
+	defer cancel()
+
+	rows, err := db.db.QueryContext(ctx, `
+		SELECT m.id, m.raw FROM Message AS m, MessageTarget AS t
+		WHERE t.network = :network AND t.target = :target AND m.target = t.id
+		ORDER BY m.id ASC`,
+		sql.Named("network", networkID),
+		sql.Named("target", name),
+	)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id int64
+		var raw string
+		if err := rows.Scan(&id, &raw); err != nil {
+			return 0, nil, err
+		}
+		msg, err := irc.ParseMessage(raw)
+		if err != nil {
+			return 0, nil, err
+		}
+		if msg.Tags["msgid"] == msgID {
+			return id, msg, nil
+		}
+	}
+	return 0, nil, rows.Err()
 }
 
 func (db *SqliteDB) GetMessageTarget(ctx context.Context, networkID int64, target string) (*MessageTarget, error) {
@@ -1159,6 +1332,9 @@ func (db *SqliteDB) StoreMessages(ctx context.Context, networkID int64, name str
 				text.Valid = true
 				text.String = stripANSI(msg.Params[1])
 			}
+		case "TAGMSG", "METADATA", "BATCH":
+			text.Valid = true
+			text.String = ""
 		}
 
 		res, err = insertStmt.ExecContext(ctx,
@@ -1191,10 +1367,13 @@ func (db *SqliteDB) ListMessageLastPerTarget(ctx context.Context, networkID int6
 		FROM Message
 		WHERE target = MessageTarget.id `
 	if !options.Events {
-		innerQuery += `AND text IS NOT NULL `
+		innerQuery += `AND text IS NOT NULL AND (
+			raw LIKE '% PRIVMSG %' OR raw LIKE 'PRIVMSG %' OR
+			raw LIKE '% NOTICE %' OR raw LIKE 'NOTICE %'
+		) `
 	}
 	innerQuery += `
-		ORDER BY time DESC
+		ORDER BY time DESC, id DESC
 		LIMIT 1
 	`
 
@@ -1265,11 +1444,18 @@ func (db *SqliteDB) ListMessages(ctx context.Context, networkID int64, name stri
 	if options.AfterID > 0 {
 		query += `AND m.id > :afterID `
 	}
-	if !options.AfterTime.IsZero() {
+	if options.BeforeID > 0 {
+		query += `AND m.id < :beforeID `
+	}
+	if options.AfterPositionID > 0 {
+		query += `AND (m.time > :after OR (m.time = :after AND m.id > :afterPositionID)) `
+	} else if !options.AfterTime.IsZero() {
 		// compares time strings by lexicographical order
 		query += `AND m.time > :after `
 	}
-	if !options.BeforeTime.IsZero() {
+	if options.BeforePositionID > 0 {
+		query += `AND (m.time < :before OR (m.time = :before AND m.id < :beforePositionID)) `
+	} else if !options.BeforeTime.IsZero() {
 		// compares time strings by lexicographical order
 		query += `AND m.time < :before `
 	}
@@ -1280,12 +1466,21 @@ func (db *SqliteDB) ListMessages(ctx context.Context, networkID int64, name stri
 		query += `AND m.id IN (SELECT ROWID FROM MessageFTS WHERE MessageFTS MATCH :text) `
 	}
 	if !options.Events {
-		query += `AND m.text IS NOT NULL `
+		query += `AND m.text IS NOT NULL AND (
+			m.raw LIKE '% PRIVMSG %' OR m.raw LIKE 'PRIVMSG %' OR
+			m.raw LIKE '% NOTICE %' OR m.raw LIKE 'NOTICE %' OR
+			m.raw LIKE '% BATCH %' OR m.raw LIKE 'BATCH %' `
+		if options.Reactions {
+			query += `OR ((m.raw LIKE '% TAGMSG %' OR m.raw LIKE 'TAGMSG %') AND (
+				m.raw LIKE '%+react%' OR m.raw LIKE '%+draft/react%' OR
+				m.raw LIKE '%+unreact%' OR m.raw LIKE '%+draft/unreact%')) `
+		}
+		query += `) `
 	}
 	if options.TakeLast {
-		query += `ORDER BY m.time DESC `
+		query += `ORDER BY m.time DESC, m.id DESC `
 	} else {
-		query += `ORDER BY m.time ASC `
+		query += `ORDER BY m.time ASC, m.id ASC `
 	}
 	query += `LIMIT :limit`
 
@@ -1293,6 +1488,9 @@ func (db *SqliteDB) ListMessages(ctx context.Context, networkID int64, name stri
 		sql.Named("network", networkID),
 		sql.Named("target", name),
 		sql.Named("afterID", options.AfterID),
+		sql.Named("beforeID", options.BeforeID),
+		sql.Named("afterPositionID", options.AfterPositionID),
+		sql.Named("beforePositionID", options.BeforePositionID),
 		sql.Named("after", sqliteTime{options.AfterTime}),
 		sql.Named("before", sqliteTime{options.BeforeTime}),
 		sql.Named("sender", options.Sender),

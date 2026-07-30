@@ -173,11 +173,11 @@ func (cm channelModes) Format() (modeString string, parameters []string) {
 const stdChannelTypes = "#&+!"
 
 var stdMemberships = []xirc.Membership{
-	{'q', '~'}, // founder
-	{'a', '&'}, // protected
-	{'o', '@'}, // operator
-	{'h', '%'}, // halfop
-	{'v', '+'}, // voice
+	{Mode: 'q', Prefix: '~'}, // founder
+	{Mode: 'a', Prefix: '&'}, // protected
+	{Mode: 'o', Prefix: '@'}, // operator
+	{Mode: 'h', Prefix: '%'}, // halfop
+	{Mode: 'v', Prefix: '+'}, // voice
 }
 
 func formatMemberPrefix(ms xirc.MembershipSet, dc *downstreamConn) string {
@@ -227,6 +227,61 @@ func copyClientTags(tags irc.Tags) irc.Tags {
 		}
 	}
 	return t
+}
+
+func hasClientTag(tags irc.Tags, name string) bool {
+	_, ok := tags[name]
+	return ok
+}
+
+func hasTagMismatch(tags irc.Tags, a, b string) bool {
+	av, hasA := tags[a]
+	bv, hasB := tags[b]
+	return hasA && hasB && av != bv
+}
+
+func normalizeTagAliases(tags irc.Tags, a, b string) {
+	av, hasA := tags[a]
+	bv, hasB := tags[b]
+	if hasA && !hasB {
+		tags[b] = av
+	} else if hasB && !hasA {
+		tags[a] = bv
+	}
+}
+
+func needsReplyReactTagNormalization(tags irc.Tags) bool {
+	return hasClientTag(tags, "+reply") != hasClientTag(tags, "+draft/reply") ||
+		hasClientTag(tags, "+react") != hasClientTag(tags, "+draft/react") ||
+		hasClientTag(tags, "+unreact") != hasClientTag(tags, "+draft/unreact")
+}
+
+func normalizeReplyReactTags(tags irc.Tags) {
+	normalizeTagAliases(tags, "+reply", "+draft/reply")
+	normalizeTagAliases(tags, "+react", "+draft/react")
+	normalizeTagAliases(tags, "+unreact", "+draft/unreact")
+}
+
+func validateReplyReactTags(tags irc.Tags) string {
+	hasReact := hasClientTag(tags, "+react") || hasClientTag(tags, "+draft/react")
+	hasUnreact := hasClientTag(tags, "+unreact") || hasClientTag(tags, "+draft/unreact")
+	hasReply := hasClientTag(tags, "+reply") || hasClientTag(tags, "+draft/reply")
+	if hasTagMismatch(tags, "+reply", "+draft/reply") {
+		return "reply and draft/reply cannot reference different messages"
+	}
+	if hasTagMismatch(tags, "+react", "+draft/react") {
+		return "react and draft/react cannot use different reactions"
+	}
+	if hasTagMismatch(tags, "+unreact", "+draft/unreact") {
+		return "unreact and draft/unreact cannot use different reactions"
+	}
+	if hasReact && hasUnreact {
+		return "Cannot send draft/react and draft/unreact on the same message"
+	}
+	if (hasReact || hasUnreact) && !hasReply {
+		return "draft/react and draft/unreact require +reply"
+	}
+	return ""
 }
 
 var stdCaseMapping = xirc.CaseMappingRFC1459
@@ -281,22 +336,32 @@ func isHighlight(text, nick string) bool {
 	}
 }
 
-// parseChatHistoryBound parses the given CHATHISTORY parameter as a bound.
-// The zero time is returned on error.
-func parseChatHistoryBound(param string) time.Time {
+type chatHistoryBound struct {
+	timestamp time.Time
+	msgID     string
+}
+
+func (bound chatHistoryBound) valid() bool {
+	return !bound.timestamp.IsZero() || bound.msgID != ""
+}
+
+// parseChatHistoryBound parses a timestamp or msgid CHATHISTORY bound.
+func parseChatHistoryBound(param string) chatHistoryBound {
 	parts := strings.SplitN(param, "=", 2)
-	if len(parts) != 2 {
-		return time.Time{}
+	if len(parts) != 2 || parts[1] == "" {
+		return chatHistoryBound{}
 	}
 	switch parts[0] {
 	case "timestamp":
 		timestamp, err := time.Parse(xirc.ServerTimeLayout, parts[1])
 		if err != nil {
-			return time.Time{}
+			return chatHistoryBound{}
 		}
-		return timestamp
+		return chatHistoryBound{timestamp: timestamp}
+	case "msgid":
+		return chatHistoryBound{msgID: parts[1]}
 	default:
-		return time.Time{}
+		return chatHistoryBound{}
 	}
 }
 

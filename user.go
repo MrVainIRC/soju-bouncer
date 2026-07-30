@@ -68,6 +68,13 @@ type eventChannelDetach struct {
 	name string
 }
 
+type eventMetadataPublishFallback struct {
+	uc     *upstreamConn
+	target string
+	key    string
+	value  *string
+}
+
 type eventBroadcast struct {
 	msg *irc.Message
 }
@@ -157,6 +164,9 @@ type network struct {
 	delivered deliveredStore
 	lastError error
 	casemap   xirc.CaseMapping
+
+	metadataLastActiveClient   string
+	metadataLastActiveUpstream *upstreamConn
 
 	pushTargetsMutex sync.Mutex
 	pushTargets      xirc.CaseMappingMap[time.Time]
@@ -775,6 +785,8 @@ func (u *user) run() {
 			if err := uc.srv.db.StoreChannel(ctx, uc.network.ID, c); err != nil {
 				u.logger.Printf("failed to store updated detached channel %q: %v", c.Name, err)
 			}
+		case eventMetadataPublishFallback:
+			e.uc.handleMetadataPublishFallback(ctx, e.target, e.key, e.value)
 		case eventDownstreamConnected:
 			dc := e.dc
 

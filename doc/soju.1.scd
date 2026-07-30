@@ -259,6 +259,20 @@ The following directives are supported:
 
 	By default, messages are kept indefinitely.
 
+*metadata-upstream-policy* any|none|last-active
+	Select which downstream clients may forward self metadata updates to the
+	upstream server. The "any" policy keeps the historical behavior, "none"
+	keeps metadata local to soju, and "last-active" only forwards updates from
+	the currently most active downstream client for the network.
+
+	By default, "any" is used.
+
+*metadata-client-sync* yes|no
+	Forward local self metadata updates from one downstream client to the other
+	metadata-capable downstream clients of the same user and network.
+
+	By default, this is disabled.
+
 *enable-user-on-auth* true|false
 	Enable users when they successfully authenticate.
 
@@ -303,6 +317,28 @@ The following directives are supported:
 
 	Warning, enabling this option without proper HTTP reverse proxy support
 	can result in broken setups where users can login but cannot upload files.
+
+*metadata-upstream-policy* any|last-active|none
+	Control how self Metadata is published to upstream networks.
+
+	- _any_ forwards self Metadata changes from each network-bound client.
+	- _last-active_ stores a separate desired Metadata profile for each stable
+	  downstream client name and network. A real user action dynamically makes
+	  that client active for the network, and soju publishes only the differences
+	  between its profile and the confirmed upstream Metadata state.
+	- _none_ keeps self Metadata local and doesn't publish it upstream.
+
+	The default is _any_. Root-session Metadata handled by
+	_metadata-root-compat_ is global and is not assigned to a client profile.
+
+*metadata-client-sync* true|false
+	Whether local self Metadata changes are broadcast to other Metadata-capable
+	downstream clients on the same network. The default is _true_.
+
+*metadata-root-compat* true|false
+	Temporarily forward global _METADATA \* SET_ and _METADATA \* CLEAR_ commands
+	received on the bouncer root session to connected Metadata-capable networks.
+	This compatibility option is disabled by default.
 
 # IRC SERVICE
 

@@ -43,6 +43,7 @@ var (
 	webpushCheckSubscriptionDelay  = 24 * time.Hour
 	webpushPruneSubscriptionDelay  = 30 * 24 * time.Hour
 	chatHistoryLimit               = 1000
+	chatHistoryClockSkewTolerance  = 10 * time.Second
 	backlogLimit                   = 4000
 )
 
@@ -199,8 +200,10 @@ func NewServer(db database.Database) *Server {
 	}
 	srv.config.Store(&Config{
 		BasicServer: config.BasicServer{
-			Hostname:        "localhost",
-			MaxUserNetworks: -1,
+			Hostname:               "localhost",
+			MaxUserNetworks:        -1,
+			MetadataUpstreamPolicy: config.MetadataUpstreamPolicyAny,
+			MetadataClientSync:     true,
 		},
 		Auth: auth.NewInternal(),
 	})
